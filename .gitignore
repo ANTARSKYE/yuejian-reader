@@ -1,0 +1,8 @@
+.yuejian-analysis-cache.json
+.yuejian-analysis-cache.tmp
+__pycache__/
+build/
+dist/
+*.spec
+.desktop-venv/
+.agents/
