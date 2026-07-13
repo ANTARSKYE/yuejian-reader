@@ -60,7 +60,8 @@ book/
 - `analysis-cache.json`：AI 分析与修订结果。
 - `analysis-timings.json`：按模型学习的分析耗时记录。
 - `ai-config.secure.json`：由 Windows DPAPI 加密的 API 设置。
-- `webview/`：用户名、主题、名言、批注和阅读统计等界面数据。
+- `ui-state.json`：用户名、头像、主题、名言、批注、阅读进度与阅读报告等界面状态。
+- `webview/`：Windows 窗口所需的 WebView 运行缓存；可删除并自动重建。
 
 将 `reader.exe` 发给别人不会附带你的 API 密钥、书籍或阅读记录。对方首次启动后会建立自己的数据目录。
 

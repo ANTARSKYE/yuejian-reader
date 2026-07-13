@@ -55,6 +55,17 @@
   </main>
   <script>
     if(new URLSearchParams(location.search).has('desktop')){document.body.classList.add('desktop');document.getElementById('brandSub').textContent='Windows 桌面版 · v1.1'}
+    const nativeStorageSetItem=Storage.prototype.setItem,nativeStorageRemoveItem=Storage.prototype.removeItem,nativeStorageClear=Storage.prototype.clear;
+    function restorePersistentUiState(){try{const request=new XMLHttpRequest();request.open('GET','/api/ui-state',false);request.send();if(request.status!==200)return;const state=JSON.parse(request.responseText).state||{};Object.entries(state).forEach(([key,value])=>{if(key.startsWith('yuejian-')&&typeof value==='string')nativeStorageSetItem.call(localStorage,key,value)})}catch(error){console.warn('界面设置恢复失败',error)}}
+    function persistentUiSnapshot(){const state={};for(let index=0;index<localStorage.length;index++){const key=localStorage.key(index);if(key?.startsWith('yuejian-'))state[key]=localStorage.getItem(key)}return state}
+    let uiStateSaveTimer=null,uiStateDirty=false;
+    function persistUiState(keepalive=false){if(uiStateSaveTimer){clearTimeout(uiStateSaveTimer);uiStateSaveTimer=null}uiStateDirty=false;return fetch('/api/ui-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:persistentUiSnapshot()}),keepalive}).catch(error=>{uiStateDirty=true;console.warn('界面设置保存失败',error)})}
+    function queueUiStateSave(){uiStateDirty=true;if(uiStateSaveTimer)clearTimeout(uiStateSaveTimer);uiStateSaveTimer=setTimeout(()=>persistUiState(),180)}
+    restorePersistentUiState();
+    Storage.prototype.setItem=function(key,value){nativeStorageSetItem.call(this,key,value);if(this===localStorage&&String(key).startsWith('yuejian-'))queueUiStateSave()};
+    Storage.prototype.removeItem=function(key){nativeStorageRemoveItem.call(this,key);if(this===localStorage&&String(key).startsWith('yuejian-'))queueUiStateSave()};
+    Storage.prototype.clear=function(){nativeStorageClear.call(this);if(this===localStorage)queueUiStateSave()};
+    window.addEventListener('pagehide',()=>{if(uiStateDirty)persistUiState(true)});
     const fileInput=document.getElementById('fileInput'),drop=document.getElementById('drop'),status=document.getElementById('fileStatus'),workspace=document.getElementById('workspace'),notice=document.getElementById('notice'),title=document.getElementById('bookTitle'),summary=document.querySelector('.summary'),answer=document.getElementById('answer'); let sessionId='',backendReady=false,analysisHtml='',currentChapterIndex=0,currentBookKey='',selectedParagraph=null,selectedText='',currentBookData=null,readingActive=false,readingTimer=null;
     const escapeHtml=value=>String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     const BUILTIN_QUOTES=[

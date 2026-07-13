@@ -32,8 +32,10 @@ TIMING_FILE = APP_DATA_DIR / "analysis-timings.json"
 AI_CONFIG_FILE = APP_DATA_DIR / "ai-config.secure.json"
 LIBRARY_DIR = APP_DATA_DIR / "library"
 LIBRARY_FILE = APP_DATA_DIR / "library.json"
+UI_STATE_FILE = APP_DATA_DIR / "ui-state.json"
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD = 30 * 1024 * 1024
+MAX_UI_STATE = 16 * 1024 * 1024
 MAX_AI_CHARS = 240_000
 SESSIONS = {}
 AI_CONFIG = {"provider": "deepseek", "key": "", "model": "deepseek-v4-flash"}
@@ -129,6 +131,40 @@ def save_library(library):
     temporary = LIBRARY_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(library, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(LIBRARY_FILE)
+
+
+def load_ui_state():
+    """读取与本机端口无关的界面状态。"""
+    try:
+        data = json.loads(UI_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {
+            key: value
+            for key, value in data.items()
+            if isinstance(key, str)
+            and key.startswith("yuejian-")
+            and isinstance(value, str)
+        }
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_ui_state(state):
+    """原子保存主题、头像、批注与阅读统计等前端状态。"""
+    if not isinstance(state, dict) or len(state) > 5000:
+        raise ValueError("界面设置数据无效。")
+    cleaned = {}
+    for key, value in state.items():
+        if not isinstance(key, str) or not key.startswith("yuejian-") or len(key) > 120:
+            continue
+        if not isinstance(value, str) or len(value.encode("utf-8")) > 8 * 1024 * 1024:
+            continue
+        cleaned[key] = value
+    temporary = UI_STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(UI_STATE_FILE)
+    return cleaned
 
 
 def extract_epub_cover(data):
@@ -959,6 +995,14 @@ class App(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path == "/api/ui-state":
+                length = int(self.headers.get("Content-Length", 0))
+                if length <= 0 or length > MAX_UI_STATE:
+                    raise ValueError("界面设置数据大小无效。")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                saved = save_ui_state(payload.get("state", {}))
+                self.send_json(200, {"saved": True, "items": len(saved)})
+                return
             if self.path == "/api/quotes/parse":
                 length = int(self.headers.get("Content-Length", 0))
                 if length > 200_000:
@@ -1074,6 +1118,9 @@ class App(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/config-status":
             self.send_json(200, {"configured": bool(AI_CONFIG["key"]), "provider": AI_CONFIG["provider"], "model": AI_CONFIG["model"], "secure_storage": os.name == "nt"})
+            return
+        if parsed.path == "/api/ui-state":
+            self.send_json(200, {"state": load_ui_state()})
             return
         if parsed.path == "/api/catalog/search":
             query = parse_qs(parsed.query).get("q", [""])[0].strip()
