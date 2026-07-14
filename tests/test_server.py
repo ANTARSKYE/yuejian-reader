@@ -31,6 +31,31 @@ def build_epub():
     return output.getvalue()
 
 
+def build_anchored_ncx_epub():
+    output = io.BytesIO()
+    paragraph = "This is section body text long enough to remain readable after anchor splitting. " * 3
+    chapter = f"""<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    <p><a href="#part-two">A link in the internal contents must not be treated as the anchor.</a></p>
+    <span id="part-one"></span><h1>Part one</h1><p>{paragraph}</p>
+    <span id="part-two"></span><h1>Part two</h1><p>{paragraph}</p>
+    <a name="part-three"></a><h1>Part three</h1><p>{paragraph}</p>
+    </body></html>"""
+    ncx = """<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap>
+    <navPoint><navLabel><text>Part one</text></navLabel><content src="chapter.xhtml#part-one"/></navPoint>
+    <navPoint><navLabel><text>Part two</text></navLabel><content src="chapter.xhtml#part-two"/></navPoint>
+    <navPoint><navLabel><text>Part three</text></navLabel><content src="chapter.xhtml#part-three"/></navPoint>
+    </navMap></ncx>"""
+    package = """<package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Anchored book</dc:title></metadata><manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine toc="ncx"><itemref idref="chapter"/></spine></package>"""
+    container = """<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OPS/package.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"""
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OPS/package.opf", package)
+        archive.writestr("OPS/toc.ncx", ncx)
+        archive.writestr("OPS/chapter.xhtml", chapter)
+    return output.getvalue()
+
+
 def valid_analysis():
     value = {
         "one_sentence": "一句话",
@@ -67,6 +92,16 @@ def test_epub_toc_sanitization_and_resources(tmp_path, monkeypatch):
     assert "onerror" not in chapters[0]["html"]
     assert "/api/book/resource" in chapters[0]["html"]
     assert "这是脚注" in chapters[0]["html"]
+
+
+def test_epub_preserves_multiple_anchored_ncx_entries_in_one_file():
+    data = build_anchored_ncx_epub()
+    title, chapters = server.extract_book("anchored.epub", data, hashlib.sha256(data).hexdigest())
+    assert title == "Anchored book"
+    assert [chapter["title"] for chapter in chapters] == ["Part one", "Part two", "Part three"]
+    assert "Part two" not in chapters[0]["text"]
+    assert "Part two" in chapters[1]["text"]
+    assert "Part three" not in chapters[1]["text"]
 
 
 def test_analysis_schema_rejects_incomplete_output():

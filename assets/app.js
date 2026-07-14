@@ -4,7 +4,7 @@ import { initializePersistentStorage } from "./ui-storage.js";
 const launchParameters = new URLSearchParams(location.search);
 if (launchParameters.has("desktop")) {
   document.body.classList.add("desktop");
-  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.3";
+  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.3.1";
 }
 if (launchParameters.has("token"))
   history.replaceState(
@@ -1593,7 +1593,9 @@ async function checkBackend() {
   try {
     const response = await fetch("/api/health", { cache: "no-store" });
     const data = await response.json();
-    if (!response.ok || !String(data.version || "").startsWith("1.2"))
+    const version = String(data.version || "").match(/^(\d+)\.(\d+)/);
+    const compatible = data.service === "yuejian" && version && Number(version[1]) === 1 && Number(version[2]) >= 2;
+    if (!response.ok || !compatible)
       throw new Error();
     backendReady = true;
     status.textContent = "本地服务已就绪";

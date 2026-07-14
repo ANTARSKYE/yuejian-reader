@@ -40,8 +40,21 @@ import java.util.zip.ZipInputStream;
 
 
 final class BookRepository extends SQLiteOpenHelper {
+    private static final String EPUB_PARSER_REVISION = "2";
     private final Context context;
     private final File booksDir;
+
+    private static final class TocEntry {
+        final String path;
+        final String fragment;
+        final String title;
+
+        TocEntry(String path, String fragment, String title) {
+            this.path = path;
+            this.fragment = fragment;
+            this.title = title;
+        }
+    }
 
     BookRepository(Context context) {
         super(context, "yuejian.db", null, 5);
@@ -120,6 +133,7 @@ final class BookRepository extends SQLiteOpenHelper {
                 deleteTree(target); target.mkdirs();
                 importEpub(temporary, target, id, displayName);
                 try (InputStream in = new FileInputStream(temporary); FileOutputStream out = new FileOutputStream(new File(target, "original.epub"))) { copy(in, out); }
+                markParserCurrent(id);
                 JSONObject refreshed = getBook(id);
                 int count = Math.max(1, refreshed.optInt("chapterCount", 1));
                 getWritableDatabase().execSQL("UPDATE books SET progress=?,current_chapter=? WHERE id=?", new Object[]{oldProgress, Math.min(oldChapter, count - 1), id});
@@ -131,6 +145,7 @@ final class BookRepository extends SQLiteOpenHelper {
             if (epub) importEpub(temporary, target, id, displayName);
             else importTxt(temporary, target, id, displayName);
             try (InputStream in = new FileInputStream(temporary); FileOutputStream out = new FileOutputStream(new File(target, epub ? "original.epub" : "original.txt"))) { copy(in, out); }
+            if (epub) markParserCurrent(id);
             return getBook(id);
         } catch (Exception error) {
             deleteTree(target);
@@ -221,12 +236,12 @@ final class BookRepository extends SQLiteOpenHelper {
                 else coverPath = coverFromHtml(target, guidePath);
             }
         }
-        Map<String, String> tocTitles = new LinkedHashMap<>();
-        if (!navHref.isEmpty()) collectNavTitles(target, resolvePath(opfDir, navHref), tocTitles);
+        List<TocEntry> tocEntries = new ArrayList<>();
+        if (!navHref.isEmpty()) collectNavEntries(target, resolvePath(opfDir, navHref), tocEntries);
         NodeList spineNodes = opf.getElementsByTagNameNS("*", "spine");
         if (spineNodes.getLength() > 0) {
             String ncxHref = manifest.get(((Element) spineNodes.item(0)).getAttribute("toc"));
-            if (ncxHref != null && !ncxHref.isEmpty()) collectNcxTitles(target, resolvePath(opfDir, ncxHref), tocTitles);
+            if (ncxHref != null && !ncxHref.isEmpty()) collectNcxEntries(target, resolvePath(opfDir, ncxHref), tocEntries);
         }
         List<String> spinePaths = new ArrayList<>();
         NodeList refs = opf.getElementsByTagNameNS("*", "itemref");
@@ -236,23 +251,19 @@ final class BookRepository extends SQLiteOpenHelper {
         }
         if (spinePaths.isEmpty()) throw new IllegalArgumentException("EPUB 没有可阅读章节");
 
-        List<String> finalPaths = spinePaths;
+        List<String> finalPaths = new ArrayList<>();
         List<String> finalTitles = new ArrayList<>();
-        if (tocTitles.size() >= 2) {
-            List<Integer> starts = new ArrayList<>();
-            for (int i = 0; i < spinePaths.size(); i++) if (tocTitles.containsKey(spinePaths.get(i))) starts.add(i);
-            if (starts.size() >= 2) {
-                finalPaths = new ArrayList<>();
-                if (starts.get(0) > 0) {
-                    String generated = combineSpineFiles(target, spinePaths.subList(0, starts.get(0)), 0);
-                    finalPaths.add(generated); finalTitles.add("封面与出版信息");
-                }
-                for (int i = 0; i < starts.size(); i++) {
-                    int from = starts.get(i), to = i + 1 < starts.size() ? starts.get(i + 1) : spinePaths.size();
-                    String generated = combineSpineFiles(target, spinePaths.subList(from, to), finalPaths.size());
-                    finalPaths.add(generated); finalTitles.add(tocTitles.get(spinePaths.get(from)));
-                }
+        if (tocEntries.isEmpty()) {
+            finalPaths.addAll(spinePaths);
+        } else {
+            Map<String, List<TocEntry>> entriesByPath = new LinkedHashMap<>();
+            for (TocEntry entry : tocEntries) entriesByPath.computeIfAbsent(entry.path, ignored -> new ArrayList<>()).add(entry);
+            for (String spinePath : spinePaths) {
+                List<TocEntry> entries = entriesByPath.get(spinePath);
+                if (entries == null || entries.isEmpty()) continue;
+                appendAnchoredSections(target, spinePath, entries, finalPaths, finalTitles);
             }
+            if (finalPaths.isEmpty()) finalPaths.addAll(spinePaths);
         }
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
@@ -262,7 +273,7 @@ final class BookRepository extends SQLiteOpenHelper {
             for (int i = 0; i < finalPaths.size(); i++) {
                 String path = finalPaths.get(i);
                 File chapter = safeFile(target, path);
-                String chapterTitle = i < finalTitles.size() ? finalTitles.get(i) : tocTitles.get(path);
+                String chapterTitle = i < finalTitles.size() ? finalTitles.get(i) : null;
                 if (chapterTitle == null || chapterTitle.isEmpty()) chapterTitle = extractHtmlTitle(chapter, "第 " + (i + 1) + " 章");
                 insertChapter(db, id, i, chapterTitle, path);
             }
@@ -280,6 +291,7 @@ final class BookRepository extends SQLiteOpenHelper {
 
     synchronized JSONObject getBook(String id) throws Exception {
         requireBookId(id);
+        ensureCurrentEpub(id);
         JSONObject book;
         try (Cursor c = getReadableDatabase().rawQuery("SELECT id,title,type,author,cover_path,added,last_opened,progress,current_chapter,chapter_count,original_name,file_size,EXISTS(SELECT 1 FROM analysis_cache a WHERE a.book_id=books.id) FROM books WHERE id=? AND deleted=0", new String[]{id})) {
             if (!c.moveToFirst()) throw new IllegalArgumentException("书籍不存在");
@@ -292,6 +304,48 @@ final class BookRepository extends SQLiteOpenHelper {
         book.put("chapters", chapters);
         getWritableDatabase().execSQL("UPDATE books SET last_opened=? WHERE id=?", new Object[]{System.currentTimeMillis(), id});
         return book;
+    }
+
+    private void markParserCurrent(String id) {
+        getWritableDatabase().execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES(?,?,?)", new Object[]{"epub_parser." + id, EPUB_PARSER_REVISION, System.currentTimeMillis()});
+    }
+
+    private void ensureCurrentEpub(String id) throws Exception {
+        SQLiteDatabase db = getWritableDatabase();
+        String type = "";
+        try (Cursor c = db.rawQuery("SELECT type FROM books WHERE id=? AND deleted=0", new String[]{id})) {
+            if (c.moveToFirst()) type = c.getString(0);
+        }
+        if (!"epub".equals(type)) return;
+        try (Cursor c = db.rawQuery("SELECT value FROM app_state WHERE key=?", new String[]{"epub_parser." + id})) {
+            if (c.moveToFirst() && EPUB_PARSER_REVISION.equals(c.getString(0))) return;
+        }
+        File root = new File(booksDir, id);
+        File original = new File(root, "original.epub");
+        if (!original.isFile()) { markParserCurrent(id); return; }
+
+        double progress = 0;
+        int oldChapter = 0;
+        long added = System.currentTimeMillis(), lastOpened = 0;
+        String oldTitle = "";
+        String originalName = "book.epub";
+        try (Cursor c = db.rawQuery("SELECT b.progress,b.current_chapter,b.added,b.last_opened,b.original_name,COALESCE(ch.title,'') FROM books b LEFT JOIN chapters ch ON ch.book_id=b.id AND ch.idx=b.current_chapter WHERE b.id=?", new String[]{id})) {
+            if (c.moveToFirst()) {
+                progress = c.getDouble(0); oldChapter = c.getInt(1); added = c.getLong(2);
+                lastOpened = c.getLong(3); originalName = c.getString(4); oldTitle = c.getString(5);
+            }
+        }
+        importEpub(original, root, id, originalName);
+        int restoredChapter = oldChapter;
+        if (!oldTitle.isEmpty()) {
+            try (Cursor c = db.rawQuery("SELECT idx FROM chapters WHERE book_id=? AND title=? ORDER BY idx LIMIT 1", new String[]{id, oldTitle})) {
+                if (c.moveToFirst()) restoredChapter = c.getInt(0);
+            }
+        }
+        int chapterCount = 1;
+        try (Cursor c = db.rawQuery("SELECT chapter_count FROM books WHERE id=?", new String[]{id})) { if (c.moveToFirst()) chapterCount = Math.max(1, c.getInt(0)); }
+        db.execSQL("UPDATE books SET progress=?,current_chapter=?,added=?,last_opened=? WHERE id=?", new Object[]{progress, Math.min(restoredChapter, chapterCount - 1), added, lastOpened, id});
+        markParserCurrent(id);
     }
 
     synchronized JSONObject getChapter(String bookId, int index) throws Exception {
@@ -643,6 +697,44 @@ final class BookRepository extends SQLiteOpenHelper {
         return output;
     }
 
+    private static void appendAnchoredSections(File root, String path, List<TocEntry> entries, List<String> outputPaths, List<String> outputTitles) throws Exception {
+        String html = sanitizeHtml(decodeText(readAll(new FileInputStream(safeFile(root, path)))));
+        Matcher body = Pattern.compile("(?is)<body[^>]*>(.*?)</body>").matcher(html);
+        String content = body.find() ? body.group(1) : html;
+        String parent = parentPath(path);
+        if (!parent.isEmpty()) content = rebaseResourceAttributes(content, parent);
+
+        List<Integer> starts = new ArrayList<>();
+        List<String> titles = new ArrayList<>();
+        for (TocEntry entry : entries) {
+            int start = entry.fragment.isEmpty() ? 0 : anchorStart(content, entry.fragment);
+            if (start < 0 || (!starts.isEmpty() && start <= starts.get(starts.size() - 1))) continue;
+            starts.add(start);
+            titles.add(entry.title);
+        }
+        if (starts.isEmpty()) {
+            starts.add(0);
+            titles.add(entries.get(0).title);
+        }
+        for (int i = 0; i < starts.size(); i++) {
+            int end = i + 1 < starts.size() ? starts.get(i + 1) : content.length();
+            String section = content.substring(starts.get(i), end).trim();
+            if (section.isEmpty()) continue;
+            String output = String.format(Locale.ROOT, "yuejian_chapter_%04d.html", outputPaths.size());
+            String wrapped = "<article class=\"yuejian-logical-chapter\">" + section + "</article>";
+            writeFile(new File(root, output), wrapped.getBytes(StandardCharsets.UTF_8));
+            outputPaths.add(output);
+            outputTitles.add(titles.get(i));
+        }
+    }
+
+    static int anchorStart(String html, String fragment) {
+        if (fragment == null || fragment.isEmpty()) return 0;
+        Pattern pattern = Pattern.compile("(?is)<[a-z][^>]*\\b(?:id|name)\\s*=\\s*(['\"])" + Pattern.quote(fragment) + "\\1[^>]*>");
+        Matcher marker = pattern.matcher(html);
+        return marker.find() ? marker.start() : -1;
+    }
+
     private static String rebaseResourceAttributes(String html, String parent) {
         Matcher matcher = Pattern.compile("(?i)(src|href)\\s*=\\s*(['\"])(?![a-z]+:|/|#)([^'\"]+)\\2").matcher(html);
         StringBuffer out = new StringBuffer();
@@ -684,18 +776,25 @@ final class BookRepository extends SQLiteOpenHelper {
         }
     }
 
-    private static void collectNavTitles(File root, String navPath, Map<String, String> titles) {
+    private static void collectNavEntries(File root, String navPath, List<TocEntry> entries) {
         try {
             Document document = parseXml(safeFile(root, navPath)); NodeList links = document.getElementsByTagNameNS("*", "a");
-            for (int i = 0; i < links.getLength(); i++) { Element link = (Element) links.item(i); String href = link.getAttribute("href"), text = link.getTextContent().replaceAll("\\s+", " ").trim(); if (!href.isEmpty() && !text.isEmpty()) titles.put(resolvePath(parentPath(navPath), href), text); }
+            for (int i = 0; i < links.getLength(); i++) { Element link = (Element) links.item(i); String href = link.getAttribute("href"), text = link.getTextContent().replaceAll("\\s+", " ").trim(); if (!href.isEmpty() && !text.isEmpty()) entries.add(tocEntry(parentPath(navPath), href, text)); }
         } catch (Exception ignored) {}
     }
 
-    private static void collectNcxTitles(File root, String ncxPath, Map<String, String> titles) {
+    private static void collectNcxEntries(File root, String ncxPath, List<TocEntry> entries) {
         try {
             Document document = parseXml(safeFile(root, ncxPath)); NodeList points = document.getElementsByTagNameNS("*", "navPoint");
-            for (int i = 0; i < points.getLength(); i++) { Element point = (Element) points.item(i); NodeList content = point.getElementsByTagNameNS("*", "content"), labels = point.getElementsByTagNameNS("*", "text"); if (content.getLength() > 0 && labels.getLength() > 0) { String src = ((Element) content.item(0)).getAttribute("src"), text = labels.item(0).getTextContent().replaceAll("\\s+", " ").trim(); if (!src.isEmpty() && !text.isEmpty()) titles.put(resolvePath(parentPath(ncxPath), src), text); } }
+            for (int i = 0; i < points.getLength(); i++) { Element point = (Element) points.item(i); NodeList content = point.getElementsByTagNameNS("*", "content"), labels = point.getElementsByTagNameNS("*", "text"); if (content.getLength() > 0 && labels.getLength() > 0) { String src = ((Element) content.item(0)).getAttribute("src"), text = labels.item(0).getTextContent().replaceAll("\\s+", " ").trim(); if (!src.isEmpty() && !text.isEmpty()) entries.add(tocEntry(parentPath(ncxPath), src, text)); } }
         } catch (Exception ignored) {}
+    }
+
+    private static TocEntry tocEntry(String base, String reference, String title) throws Exception {
+        String[] parts = reference.split("#", 2);
+        String path = resolvePath(base, parts[0]);
+        String fragment = parts.length > 1 ? URLDecoder.decode(parts[1], "UTF-8") : "";
+        return new TocEntry(path, fragment, title);
     }
 
     private static String firstTagText(Document doc, String name, String fallback) {

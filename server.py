@@ -36,7 +36,7 @@ from storage import atomic_write_bytes, configure_logging, read_json, update_jso
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Yuejian"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 CACHE_FILE = APP_DATA_DIR / "analysis-cache.json"
 TIMING_FILE = APP_DATA_DIR / "analysis-timings.json"
 CHUNK_CACHE_FILE = APP_DATA_DIR / "analysis-chunks.json"
@@ -408,7 +408,7 @@ def html_to_text(raw):
 
 
 class ReaderSanitizer(HTMLParser):
-    ALLOWED = {"p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6", "em", "strong", "blockquote", "ul", "ol", "li", "sup", "sub", "hr", "a", "img", "figure", "figcaption", "aside"}
+    ALLOWED = {"p", "div", "span", "br", "h1", "h2", "h3", "h4", "h5", "h6", "em", "strong", "blockquote", "ul", "ol", "li", "sup", "sub", "hr", "a", "img", "figure", "figcaption", "aside"}
     VOID = {"br", "hr", "img"}
 
     def __init__(self, base_path, book_hash):
@@ -486,8 +486,9 @@ def decode_txt(data):
     return data.decode("utf-8", errors="replace")
 
 
-def epub_toc_titles(archive, manifest, base):
-    titles = {}
+def epub_toc_entries(archive, manifest, base):
+    entries = []
+    seen = set()
     candidates = [item for item in manifest.values() if "nav" in item.get("properties", "") or item.get("media-type") == "application/x-dtbncx+xml"]
     for item in candidates:
         href = item.get("href", "")
@@ -498,18 +499,56 @@ def epub_toc_titles(archive, manifest, base):
             continue
         for node in root.iter():
             if node.tag.endswith("a") and node.attrib.get("href"):
-                target = node.attrib["href"].split("#", 1)[0]
+                target, _, fragment = node.attrib["href"].partition("#")
                 full = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(target)))
                 label = clean_title("".join(node.itertext()))
-                if label:
-                    titles[full] = label
+                key = (full, unquote(fragment), label)
+                if label and key not in seen:
+                    entries.append({"path": full, "fragment": unquote(fragment), "title": label})
+                    seen.add(key)
             if node.tag.endswith("navPoint"):
                 source = next((child.attrib.get("src") for child in node.iter() if child.tag.endswith("content")), "")
                 label = next((clean_title("".join(child.itertext())) for child in node.iter() if child.tag.endswith("navLabel")), "")
                 if source and label:
-                    full = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(source.split("#", 1)[0])))
-                    titles[full] = label
-    return titles
+                    target, _, fragment = source.partition("#")
+                    full = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(target)))
+                    key = (full, unquote(fragment), label)
+                    if key not in seen:
+                        entries.append({"path": full, "fragment": unquote(fragment), "title": label})
+                        seen.add(key)
+    return entries
+
+
+def split_epub_document(document, toc_entries):
+    """Split one spine document at real id/name anchors without duplicating its text."""
+    html = document["html"]
+    markers = []
+    for entry in toc_entries:
+        fragment = entry.get("fragment", "")
+        if fragment:
+            marker = re.search(
+                r"<[a-z][^>]*\b(?:id|name)\s*=\s*(['\"])" + re.escape(fragment) + r"\1[^>]*>",
+                html,
+                flags=re.I,
+            )
+            if not marker:
+                continue
+            start = marker.start()
+        else:
+            start = 0
+        if markers and start <= markers[-1][0]:
+            continue
+        markers.append((start, entry["title"]))
+    if not markers:
+        return [{key: value for key, value in document.items() if key != "path"}]
+    result = []
+    for index, (start, title) in enumerate(markers):
+        end = markers[index + 1][0] if index + 1 < len(markers) else len(html)
+        fragment_html = html[start:end].strip()
+        text = html_to_text(fragment_html.encode("utf-8"))
+        if text or "<img" in fragment_html.lower():
+            result.append({"title": title, "text": text, "html": fragment_html})
+    return result
 
 
 def extract_epub(data, fallback_title, book_hash):
@@ -525,7 +564,10 @@ def extract_epub(data, fallback_title, book_hash):
         manifest = {node.attrib.get("id"): node.attrib for node in package.iter() if node.tag.endswith("item")}
         spine = [node.attrib.get("idref") for node in package.iter() if node.tag.endswith("itemref")]
         base = posixpath.dirname(rootfile)
-        toc_titles = epub_toc_titles(archive, manifest, base)
+        toc_entries = epub_toc_entries(archive, manifest, base)
+        entries_by_path = {}
+        for entry in toc_entries:
+            entries_by_path.setdefault(entry["path"], []).append(entry)
         spine_documents = []
         for index, item_id in enumerate(spine, 1):
             item = manifest.get(item_id, {})
@@ -538,27 +580,15 @@ def extract_epub(data, fallback_title, book_hash):
             except KeyError:
                 continue
             text = html_to_text(raw)
-            if len(text) > 80 or path in toc_titles:
-                heading = toc_titles.get(path) or next((line for line in text.splitlines() if 2 < len(line) < 80), f"第 {index} 节")
+            if len(text) > 80 or path in entries_by_path:
+                heading = (entries_by_path.get(path) or [{}])[0].get("title") or next((line for line in text.splitlines() if 2 < len(line) < 80), f"第 {index} 节")
                 spine_documents.append({"path": path, "title": heading, "text": text, "html": sanitize_reader_html(raw, path, book_hash)})
         chapters = []
-        starts = [i for i, chapter in enumerate(spine_documents) if chapter["path"] in toc_titles]
-        if len(starts) >= 2:
-            groups = []
-            if starts[0] > 0:
-                groups.append((0, starts[0], "封面与出版信息"))
-            for position, start in enumerate(starts):
-                end = starts[position + 1] if position + 1 < len(starts) else len(spine_documents)
-                groups.append((start, end, toc_titles[spine_documents[start]["path"]]))
-            for start, end, heading in groups:
-                parts = spine_documents[start:end]
-                chapters.append({
-                    "title": heading,
-                    "text": "\n\n".join(part["text"] for part in parts),
-                    "html": "".join(f'<section class="epub-spine-part">{part["html"]}</section>' for part in parts),
-                })
-        else:
-            chapters = [{key: value for key, value in chapter.items() if key != "path"} for chapter in spine_documents]
+        for document in spine_documents:
+            document_entries = entries_by_path.get(document["path"], [])
+            if toc_entries and not document_entries:
+                continue
+            chapters.extend(split_epub_document(document, document_entries))
         if not chapters:
             raise ValueError("未能从 EPUB 提取到可阅读的正文。")
     chapters = split_numbered_chapters(chapters)
