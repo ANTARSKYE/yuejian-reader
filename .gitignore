@@ -1,8 +1,32 @@
+# Python / desktop build outputs
+.venv/
+.desktop-venv/
+.agents/
 .yuejian-analysis-cache.json
 .yuejian-analysis-cache.tmp
 __pycache__/
+*.py[cod]
+.pytest_cache/
 build/
 dist/
-*.spec
-.desktop-venv/
-.agents/
+release-assets/
+reader.spec
+
+# Android local toolchains, caches and signed artifacts
+android/.gradle/
+android/sdk/
+android/tools/
+android/build/
+android/app/build/
+android/release/
+android/local.properties
+*.keystore
+*password*.txt
+
+# Local application data and editor files
+.idea/
+.vscode/
+*.log
+Thumbs.db
+.DS_Store
+/QQ*.png

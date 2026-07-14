@@ -1,0 +1,1 @@
+-keepclassmembers class com.yuejian.reader.MainActivity$AndroidBridge { public *; }

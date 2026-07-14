@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install pytest==9.1.1
+      - run: python -m pytest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --check assets/app.js
+      - run: node --check assets/ui-storage.js
+      - run: node --check assets/accessibility.js
+      - run: node --check android/app/src/main/assets/features.js
+      - run: node --check android/app/src/main/assets/reader-enhancements.js

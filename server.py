@@ -1,34 +1,45 @@
-"""阅见的本地服务：解析 EPUB/TXT，并通过 OpenAI Responses API 生成阅读辅助信息。"""
-import cgi
+"""阅见的本地服务：解析 EPUB/TXT，并通过 AI API 生成阅读辅助信息。"""
 import base64
 import ctypes
 import hashlib
 import io
 import json
+import logging
 import mimetypes
 import os
+import platform
 import posixpath
 import re
 import secrets
 import sys
+import threading
+import tempfile
 import time
 import urllib.error
 import urllib.request
 import webbrowser
 import zipfile
+from collections import OrderedDict
+from email import policy
+from email.parser import BytesParser
 from html import escape
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlencode, urlparse
 from xml.etree import ElementTree as ET
+
+from ai_client import request as provider_ai_request
+from storage import atomic_write_bytes, configure_logging, read_json, update_json, write_json
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Yuejian"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+VERSION = "1.3.0"
 CACHE_FILE = APP_DATA_DIR / "analysis-cache.json"
 TIMING_FILE = APP_DATA_DIR / "analysis-timings.json"
+CHUNK_CACHE_FILE = APP_DATA_DIR / "analysis-chunks.json"
 AI_CONFIG_FILE = APP_DATA_DIR / "ai-config.secure.json"
 LIBRARY_DIR = APP_DATA_DIR / "library"
 LIBRARY_FILE = APP_DATA_DIR / "library.json"
@@ -37,25 +48,66 @@ LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD = 30 * 1024 * 1024
 MAX_UI_STATE = 16 * 1024 * 1024
 MAX_AI_CHARS = 240_000
-SESSIONS = {}
+MAX_JSON_BODY = 1 * 1024 * 1024
+LOGGER = configure_logging(APP_DATA_DIR)
 AI_CONFIG = {"provider": "deepseek", "key": "", "model": "deepseek-v4-flash"}
 GUTENBERG_HOST = "www.gutenberg.org"
 WIKISOURCE_HOST = "zh.wikisource.org"
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom", "dcterms": "http://purl.org/dc/terms/"}
 
 
+class SessionStore:
+    """Bounded in-memory sessions with idle expiry."""
+
+    def __init__(self, max_items=12, ttl_seconds=4 * 60 * 60):
+        self.max_items = max_items
+        self.ttl_seconds = ttl_seconds
+        self._items = OrderedDict()
+        self._lock = threading.RLock()
+
+    def put(self, session_id, value):
+        with self._lock:
+            self.cleanup()
+            value["_last_access"] = time.monotonic()
+            self._items[session_id] = value
+            self._items.move_to_end(session_id)
+            while len(self._items) > self.max_items:
+                self._items.popitem(last=False)
+
+    def get(self, session_id, default=None):
+        with self._lock:
+            self.cleanup()
+            value = self._items.get(session_id)
+            if value is None:
+                return default
+            value["_last_access"] = time.monotonic()
+            self._items.move_to_end(session_id)
+            return value
+
+    def cleanup(self):
+        cutoff = time.monotonic() - self.ttl_seconds
+        expired = [key for key, value in self._items.items() if value.get("_last_access", 0) < cutoff]
+        for key in expired:
+            self._items.pop(key, None)
+
+    def __len__(self):
+        with self._lock:
+            self.cleanup()
+            return len(self._items)
+
+
+SESSIONS = SessionStore()
+ACTIVE_ANALYSES = {}
+ACTIVE_ANALYSES_LOCK = threading.RLock()
+
+
 def load_analysis_cache():
-    try:
-        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+    data = read_json(CACHE_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 
 def save_analysis_cache(cache):
-    temporary = CACHE_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(CACHE_FILE)
+    write_json(CACHE_FILE, cache)
 
 
 class DataBlob(ctypes.Structure):
@@ -99,14 +151,12 @@ def save_ai_config():
         "protected_key": windows_protect(AI_CONFIG["key"]),
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
-    temporary = AI_CONFIG_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(AI_CONFIG_FILE)
+    write_json(AI_CONFIG_FILE, saved)
 
 
 def load_ai_config():
     try:
-        saved = json.loads(AI_CONFIG_FILE.read_text(encoding="utf-8"))
+        saved = read_json(AI_CONFIG_FILE, {})
         provider = saved.get("provider")
         model = str(saved.get("model", "")).strip()
         key = windows_unprotect(saved.get("protected_key", ""))
@@ -120,23 +170,18 @@ load_ai_config()
 
 
 def load_library():
-    try:
-        data = json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+    data = read_json(LIBRARY_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 
 def save_library(library):
-    temporary = LIBRARY_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(library, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(LIBRARY_FILE)
+    write_json(LIBRARY_FILE, library)
 
 
 def load_ui_state():
     """读取与本机端口无关的界面状态。"""
     try:
-        data = json.loads(UI_STATE_FILE.read_text(encoding="utf-8"))
+        data = read_json(UI_STATE_FILE, {})
         if not isinstance(data, dict):
             return {}
         return {
@@ -161,10 +206,26 @@ def save_ui_state(state):
         if not isinstance(value, str) or len(value.encode("utf-8")) > 8 * 1024 * 1024:
             continue
         cleaned[key] = value
-    temporary = UI_STATE_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(UI_STATE_FILE)
+    write_json(UI_STATE_FILE, cleaned)
     return cleaned
+
+
+def patch_ui_state(patch):
+    if not isinstance(patch, dict) or len(patch) > 500:
+        raise ValueError("界面设置增量数据无效。")
+
+    def apply(current):
+        current = current if isinstance(current, dict) else {}
+        for key, value in patch.items():
+            if not isinstance(key, str) or not key.startswith("yuejian-") or len(key) > 120:
+                continue
+            if value is None:
+                current.pop(key, None)
+            elif isinstance(value, str) and len(value.encode("utf-8")) <= 8 * 1024 * 1024:
+                current[key] = value
+        return current
+
+    return update_json(UI_STATE_FILE, {}, apply)
 
 
 def extract_epub_cover(data):
@@ -213,9 +274,7 @@ def save_book_cover(book_hash, data):
     cover_name = f"{book_hash}-cover{extension}"
     target = LIBRARY_DIR / cover_name
     if not target.exists():
-        temporary = target.with_suffix(extension + ".tmp")
-        temporary.write_bytes(cover)
-        temporary.replace(target)
+        atomic_write_bytes(target, cover)
     return cover_name
 
 
@@ -245,30 +304,33 @@ def remember_book(book_hash, original_name, title, data):
     stored_name = f"{book_hash}{extension}"
     target = LIBRARY_DIR / stored_name
     if not target.exists():
-        temporary = target.with_suffix(extension + ".tmp")
-        temporary.write_bytes(data)
-        temporary.replace(target)
-    library = load_library()
+        atomic_write_bytes(target, data)
     now = datetime.now(timezone.utc).isoformat()
-    previous = library.get(book_hash, {})
-    cover_name = previous.get("cover_name", "")
+    existing = load_library().get(book_hash, {})
+    cover_name = existing.get("cover_name", "")
     if extension == ".epub" and (not cover_name or not (LIBRARY_DIR / cover_name).exists()):
         cover_name = save_book_cover(book_hash, data)
-    library[book_hash] = {
-        "title": title,
-        "original_name": Path(original_name).name[:240],
-        "stored_name": stored_name,
-        "file_size": len(data),
-        "added_at": previous.get("added_at", now),
-        "last_opened": now,
-        "cover_name": cover_name,
-    }
-    save_library(library)
+
+    def update(library):
+        library = library if isinstance(library, dict) else {}
+        previous = library.get(book_hash, {})
+        library[book_hash] = {
+            "title": title,
+            "original_name": Path(original_name).name[:240],
+            "stored_name": stored_name,
+            "file_size": len(data),
+            "added_at": previous.get("added_at", now),
+            "last_opened": now,
+            "cover_name": cover_name or previous.get("cover_name", ""),
+        }
+        return library
+
+    update_json(LIBRARY_FILE, {}, update)
 
 
 def prepare_book_payload(name, data):
     book_hash = hashlib.sha256(data).hexdigest()
-    title, chapters = extract_book(name, data)
+    title, chapters = extract_book(name, data, book_hash)
     remember_book(book_hash, name, title, data)
     excerpt = compact_book(chapters)
     session_id = secrets.token_urlsafe(18)
@@ -276,14 +338,13 @@ def prepare_book_payload(name, data):
     chunk_plan = analysis_chunk_plan(chapters)
     analysis_chunks = len(build_analysis_chunks(chapters, chunk_plan["target_chars"]))
     complexity, complexity_score, estimated_seconds, timing_samples = estimate_analysis("\n".join(x["text"] for x in chapters), chapters)
-    SESSIONS[session_id] = {"title": title, "text": excerpt, "chapters": chapters, "book_hash": book_hash, "source_chars": source_chars, "complexity_score": complexity_score, "estimated_seconds": estimated_seconds, "chunk_target_chars": chunk_plan["target_chars"], "analysis_chunks": analysis_chunks}
+    SESSIONS.put(session_id, {"title": title, "text": excerpt, "chapters": chapters, "book_hash": book_hash, "source_chars": source_chars, "complexity_score": complexity_score, "estimated_seconds": estimated_seconds, "chunk_target_chars": chunk_plan["target_chars"], "analysis_chunks": analysis_chunks})
     cached = load_analysis_cache().get(book_hash)
     return {"title": title, "chapters": [x["title"] for x in chapters], "session_id": session_id, "book_hash": book_hash, "total_chars": source_chars, "analyzed_chars": source_chars, "complexity": complexity, "estimated_seconds": estimated_seconds, "analysis_chunks": analysis_chunks, "chunk_target_chars": chunk_plan["target_chars"], "timing_samples": timing_samples, "estimate_method": "learned" if timing_samples else "baseline", "cached_analysis": cached.get("analysis") if cached else None, "cache_meta": {key: cached.get(key) for key in ("provider", "model", "analyzed_at", "revision_count")} if cached else None}
 
 
 def persist_analysis(session, analysis, revision_count):
-    cache = load_analysis_cache()
-    cache[session["book_hash"]] = {
+    entry = {
         "title": session["title"],
         "analysis": analysis,
         "provider": AI_CONFIG["provider"],
@@ -291,9 +352,16 @@ def persist_analysis(session, analysis, revision_count):
         "analyzed_at": datetime.now(timezone.utc).isoformat(),
         "revision_count": revision_count,
         "chapter_count": len(session["chapters"]),
+        "app_version": VERSION,
     }
-    save_analysis_cache(cache)
-    return cache[session["book_hash"]]
+
+    def update(cache):
+        cache = cache if isinstance(cache, dict) else {}
+        cache[session["book_hash"]] = entry
+        return cache
+
+    update_json(CACHE_FILE, {}, update)
+    return entry
 
 
 class TextExtractor(HTMLParser):
@@ -305,7 +373,7 @@ class TextExtractor(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style", "nav", "svg"):
             self.skip += 1
-        if tag in ("p", "div", "br", "li", "h1", "h2", "h3"):
+        if tag in ("p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "tr", "aside"):
             self.parts.append("\n")
 
     def handle_endtag(self, tag):
@@ -320,10 +388,89 @@ class TextExtractor(HTMLParser):
         return re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n", "".join(self.parts))).strip()
 
 
+def decode_markup(raw):
+    head = raw[:1024].decode("ascii", errors="ignore")
+    match = re.search(r"(?:encoding\s*=\s*['\"]|charset\s*=\s*)([A-Za-z0-9._-]+)", head, flags=re.I)
+    encodings = [match.group(1)] if match else []
+    encodings.extend(["utf-8-sig", "utf-16", "gb18030"])
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def html_to_text(raw):
     parser = TextExtractor()
-    parser.feed(raw.decode("utf-8", errors="replace"))
+    parser.feed(decode_markup(raw))
     return parser.text()
+
+
+class ReaderSanitizer(HTMLParser):
+    ALLOWED = {"p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6", "em", "strong", "blockquote", "ul", "ol", "li", "sup", "sub", "hr", "a", "img", "figure", "figcaption", "aside"}
+    VOID = {"br", "hr", "img"}
+
+    def __init__(self, base_path, book_hash):
+        super().__init__(convert_charrefs=True)
+        self.base_path = base_path
+        self.book_hash = book_hash
+        self.parts = []
+        self.blocked = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in ("script", "style", "iframe", "object", "embed", "svg"):
+            self.blocked += 1
+            return
+        if self.blocked:
+            return
+        if tag not in self.ALLOWED:
+            return
+        values = dict(attrs)
+        safe_attrs = []
+        element_id = values.get("id") or values.get("name")
+        if element_id and re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", element_id):
+            safe_attrs.append(f'id="{escape(element_id, quote=True)}"')
+        if tag == "img":
+            source = unquote(values.get("src", "").split("#", 1)[0])
+            if source and not urlparse(source).scheme:
+                resource = posixpath.normpath(posixpath.join(posixpath.dirname(self.base_path), source))
+                if not resource.startswith("../") and not resource.startswith("/"):
+                    url = f"/api/book/resource?book_hash={self.book_hash}&path={quote(resource, safe='')}"
+                    safe_attrs.append(f'src="{escape(url, quote=True)}"')
+            alt = values.get("alt", "")[:300]
+            safe_attrs.append(f'alt="{escape(alt, quote=True)}"')
+            safe_attrs.append('loading="lazy"')
+        elif tag == "a":
+            href = values.get("href", "")
+            if href.startswith("#") and re.fullmatch(r"#[A-Za-z0-9_.:-]{1,120}", href):
+                safe_attrs.append(f'href="{escape(href, quote=True)}"')
+        attributes = (" " + " ".join(safe_attrs)) if safe_attrs else ""
+        self.parts.append(f"<{tag}{attributes}>")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("script", "style", "iframe", "object", "embed", "svg") and self.blocked:
+            self.blocked -= 1
+            return
+        if self.blocked:
+            return
+        if tag in self.ALLOWED and tag not in self.VOID:
+            self.parts.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self.blocked:
+            self.parts.append(escape(data))
+
+    def html(self):
+        return "".join(self.parts)
+
+
+def sanitize_reader_html(raw, path, book_hash):
+    parser = ReaderSanitizer(path, book_hash)
+    parser.feed(decode_markup(raw))
+    return parser.html()
 
 
 def clean_title(value):
@@ -339,7 +486,33 @@ def decode_txt(data):
     return data.decode("utf-8", errors="replace")
 
 
-def extract_epub(data, fallback_title):
+def epub_toc_titles(archive, manifest, base):
+    titles = {}
+    candidates = [item for item in manifest.values() if "nav" in item.get("properties", "") or item.get("media-type") == "application/x-dtbncx+xml"]
+    for item in candidates:
+        href = item.get("href", "")
+        path = posixpath.normpath(posixpath.join(base, unquote(href)))
+        try:
+            root = ET.fromstring(archive.read(path))
+        except (KeyError, ET.ParseError):
+            continue
+        for node in root.iter():
+            if node.tag.endswith("a") and node.attrib.get("href"):
+                target = node.attrib["href"].split("#", 1)[0]
+                full = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(target)))
+                label = clean_title("".join(node.itertext()))
+                if label:
+                    titles[full] = label
+            if node.tag.endswith("navPoint"):
+                source = next((child.attrib.get("src") for child in node.iter() if child.tag.endswith("content")), "")
+                label = next((clean_title("".join(child.itertext())) for child in node.iter() if child.tag.endswith("navLabel")), "")
+                if source and label:
+                    full = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(source.split("#", 1)[0])))
+                    titles[full] = label
+    return titles
+
+
+def extract_epub(data, fallback_title, book_hash):
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         if sum(item.file_size for item in archive.infolist()) > 80 * 1024 * 1024:
             raise ValueError("电子书解压后的内容过大，请选择 80MB 以下的书籍。")
@@ -352,7 +525,8 @@ def extract_epub(data, fallback_title):
         manifest = {node.attrib.get("id"): node.attrib for node in package.iter() if node.tag.endswith("item")}
         spine = [node.attrib.get("idref") for node in package.iter() if node.tag.endswith("itemref")]
         base = posixpath.dirname(rootfile)
-        chapters = []
+        toc_titles = epub_toc_titles(archive, manifest, base)
+        spine_documents = []
         for index, item_id in enumerate(spine, 1):
             item = manifest.get(item_id, {})
             href = item.get("href")
@@ -364,9 +538,27 @@ def extract_epub(data, fallback_title):
             except KeyError:
                 continue
             text = html_to_text(raw)
-            if len(text) > 80:
-                heading = next((line for line in text.splitlines() if 2 < len(line) < 80), f"第 {index} 节")
-                chapters.append({"title": heading, "text": text})
+            if len(text) > 80 or path in toc_titles:
+                heading = toc_titles.get(path) or next((line for line in text.splitlines() if 2 < len(line) < 80), f"第 {index} 节")
+                spine_documents.append({"path": path, "title": heading, "text": text, "html": sanitize_reader_html(raw, path, book_hash)})
+        chapters = []
+        starts = [i for i, chapter in enumerate(spine_documents) if chapter["path"] in toc_titles]
+        if len(starts) >= 2:
+            groups = []
+            if starts[0] > 0:
+                groups.append((0, starts[0], "封面与出版信息"))
+            for position, start in enumerate(starts):
+                end = starts[position + 1] if position + 1 < len(starts) else len(spine_documents)
+                groups.append((start, end, toc_titles[spine_documents[start]["path"]]))
+            for start, end, heading in groups:
+                parts = spine_documents[start:end]
+                chapters.append({
+                    "title": heading,
+                    "text": "\n\n".join(part["text"] for part in parts),
+                    "html": "".join(f'<section class="epub-spine-part">{part["html"]}</section>' for part in parts),
+                })
+        else:
+            chapters = [{key: value for key, value in chapter.items() if key != "path"} for chapter in spine_documents]
         if not chapters:
             raise ValueError("未能从 EPUB 提取到可阅读的正文。")
     chapters = split_numbered_chapters(chapters)
@@ -400,6 +592,8 @@ def reader_html(text):
 
 
 def split_numbered_chapters(source_chapters):
+    if len(source_chapters) > 3:
+        return [{**chapter, "html": chapter.get("html") or reader_html(chapter["text"])} for chapter in source_chapters]
     combined = "\n".join(chapter["text"] for chapter in source_chapters if len(chapter["text"]) > 1000)
     pattern = re.compile(r"(?m)^\s*(第([一二三四五六七八九十百0-9]+)章[^\n]*)\s*$")
     matches = list(pattern.finditer(combined))
@@ -420,7 +614,10 @@ def split_numbered_chapters(source_chapters):
         sequences.append(current)
     valid = [sequence for sequence in sequences if len(sequence) >= 3]
     if not valid:
-        return [{**chapter, "html": reader_html(chapter["text"])} for chapter in source_chapters]
+        return [
+            {**chapter, "html": chapter.get("html") or reader_html(chapter["text"])}
+            for chapter in source_chapters
+        ]
     sequence = max(valid, key=lambda item: (len(item), item[0][1].start()))
     title_by_number = {}
     for match in matches:
@@ -437,7 +634,7 @@ def split_numbered_chapters(source_chapters):
     return result
 
 
-def extract_book(name, data):
+def extract_book(name, data, book_hash=""):
     ext = Path(name).suffix.lower()
     fallback = Path(name).stem
     if ext == ".txt":
@@ -449,7 +646,7 @@ def extract_book(name, data):
         chapters = chapters or [{"title": "正文", "text": text}]
         return fallback, [{**chapter, "html": reader_html(chapter["text"])} for chapter in chapters]
     if ext == ".epub":
-        return extract_epub(data, fallback)
+        return extract_epub(data, fallback, book_hash or hashlib.sha256(data).hexdigest())
     raise ValueError("目前支持 EPUB 和 TXT 格式。")
 
 
@@ -468,16 +665,12 @@ def compact_book(chapters):
 
 
 def load_timing_history():
-    try:
-        data = json.loads(TIMING_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return []
+    data = read_json(TIMING_FILE, [])
+    return data if isinstance(data, list) else []
 
 
 def save_timing_sample(session, elapsed_seconds):
-    history = load_timing_history()
-    history.append({
+    sample = {
         "provider": AI_CONFIG["provider"],
         "model": AI_CONFIG["model"],
         "chars": session.get("source_chars", len(session["text"])),
@@ -486,11 +679,13 @@ def save_timing_sample(session, elapsed_seconds):
         "analysis_schema": 2,
         "seconds": round(max(0.1, elapsed_seconds), 2),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
-    })
-    history = history[-300:]
-    temporary = TIMING_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(TIMING_FILE)
+    }
+
+    def update(history):
+        history = history if isinstance(history, list) else []
+        return (history + [sample])[-300:]
+
+    history = update_json(TIMING_FILE, [], update)
     return len([x for x in history if x.get("provider") == AI_CONFIG["provider"] and x.get("model") == AI_CONFIG["model"] and x.get("analysis_schema") == 2])
 
 
@@ -518,42 +713,9 @@ def estimate_analysis(text, chapters):
     return complexity, complexity_score, seconds, len(samples)
 
 
-def output_text(response):
-    if response.get("output_text"):
-        return response["output_text"]
-    parts = []
-    for item in response.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") in ("output_text", "text"):
-                parts.append(content.get("text", ""))
-    return "\n".join(parts)
-
-
 def ai_request(instructions, user_input, json_output=False, max_tokens=8000):
-    key = AI_CONFIG["key"] or os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise ValueError("尚未配置 API 密钥。请点击页面右上角的「AI 设置」。")
-    if AI_CONFIG["provider"] == "deepseek":
-        body = {"model": AI_CONFIG["model"], "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": user_input}], "stream": False, "max_tokens": max_tokens}
-        if json_output:
-            body["response_format"] = {"type": "json_object"}
-        url = "https://api.deepseek.com/chat/completions"
-    else:
-        body = {"model": AI_CONFIG["model"], "instructions": instructions, "input": user_input, "max_output_tokens": max_tokens}
-        url = "https://api.openai.com/v1/responses"
-    payload = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(url, data=payload, method="POST", headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            if AI_CONFIG["provider"] == "deepseek":
-                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return output_text(data)
-    except urllib.error.HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
-        raise ValueError(f"AI 服务返回错误：{details[:500]}")
-    except urllib.error.URLError as error:
-        raise ValueError(f"无法连接 AI 服务：{error.reason}")
+    config = {**AI_CONFIG, "key": AI_CONFIG["key"] or os.environ.get("OPENAI_API_KEY", "")}
+    return provider_ai_request(config, instructions, user_input, json_output, max_tokens)
 
 
 ANALYSIS_INSTRUCTIONS = """你是一位严谨、善于教学的中文阅读导师。你的任务不是写一段泛泛简介，而是生成一份能实际指导读者理解、阅读、记忆与思考本书的深度阅读报告。
@@ -687,15 +849,53 @@ def build_analysis_chunks(chapters, target_chars=None):
     return chunks or ["## 空白文本\n未提取到可供分析的正文。"]
 
 
+def chunk_cache_key(session, chunk):
+    identity = "\n".join((
+        "notes-v2",
+        AI_CONFIG["provider"],
+        AI_CONFIG["model"],
+        session["book_hash"],
+        hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def load_chunk_cache():
+    data = read_json(CHUNK_CACHE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_chunk_note(key, note, book_hash):
+    def update(cache):
+        cache = cache if isinstance(cache, dict) else {}
+        cache[key] = {"note": note, "book_hash": book_hash, "saved_at": datetime.now(timezone.utc).isoformat()}
+        if len(cache) > 500:
+            ordered = sorted(cache.items(), key=lambda item: item[1].get("saved_at", ""))[-500:]
+            cache = dict(ordered)
+        return cache
+
+    update_json(CHUNK_CACHE_FILE, {}, update)
+
+
 def build_chunk_notes(session):
     chunks = build_analysis_chunks(session["chapters"], session.get("chunk_target_chars"))
     notes = []
+    cached_notes = load_chunk_cache()
+    cancel_event = session.get("_cancel_event")
     for index, chunk in enumerate(chunks, 1):
+        if cancel_event and cancel_event.is_set():
+            raise ValueError("分析已取消；已完成的分段笔记已保存，下次可继续。")
+        cache_key = chunk_cache_key(session, chunk)
+        cached = cached_notes.get(cache_key, {})
+        note = str(cached.get("note", "")).strip()
         prompt = f"书名：{session['title']}\n分段：{index}/{len(chunks)}\n\n{chunk}"
-        try:
-            note = ai_request(CHUNK_NOTE_INSTRUCTIONS, prompt, max_tokens=1300).strip()
-        except ValueError as error:
-            raise ValueError(f"第 {index}/{len(chunks)} 段阅读失败：{error}")
+        if not note:
+            try:
+                note = ai_request(CHUNK_NOTE_INSTRUCTIONS, prompt, max_tokens=1300).strip()
+            except ValueError as error:
+                raise ValueError(f"第 {index}/{len(chunks)} 段阅读失败：{error}")
+            if note:
+                save_chunk_note(cache_key, note[:1800], session["book_hash"])
         if not note:
             raise ValueError(f"第 {index}/{len(chunks)} 段没有返回阅读笔记，请重试。")
         notes.append(f"【分段 {index}/{len(chunks)}】\n{note[:1800]}")
@@ -709,6 +909,32 @@ def compact_previous_analysis(previous):
     return text[:9000] + ("…" if len(text) > 9000 else "")
 
 
+ANALYSIS_LIST_FIELDS = (
+    "outline", "key_points", "core_concepts", "argument_map",
+    "chapter_connections", "key_figures", "misconceptions",
+    "critical_questions", "practical_insights", "memory_cards",
+    "further_directions",
+)
+
+
+def validate_analysis(value):
+    """Reject structurally incomplete model output before it reaches the cache."""
+    if not isinstance(value, dict):
+        raise ValueError("AI 报告不是对象。")
+    required_strings = ("one_sentence", "book_purpose", "caveat")
+    if any(not isinstance(value.get(key), str) or not value[key].strip() for key in required_strings):
+        raise ValueError("AI 报告缺少必要的文字字段。")
+    if not isinstance(value.get("domain"), dict) or not isinstance(value.get("executive_summary"), dict):
+        raise ValueError("AI 报告缺少领域或摘要结构。")
+    if not isinstance(value.get("reading_guide"), dict):
+        raise ValueError("AI 报告缺少阅读路线。")
+    for key in ANALYSIS_LIST_FIELDS:
+        if not isinstance(value.get(key), list):
+            raise ValueError(f"AI 报告字段 {key} 的类型不正确。")
+    value["schema_version"] = 2
+    return value
+
+
 def make_chunked_analysis(session, previous=None):
     notes = build_chunk_notes(session)
     chapter_list = "\n".join(f"{index + 1}. {chapter['title']}" for index, chapter in enumerate(session["chapters"]))
@@ -718,11 +944,11 @@ def make_chunked_analysis(session, previous=None):
     input_text = f"书名：{session['title']}\n完整章节目录：\n{chapter_list}\n\n逐段阅读笔记：\n" + "\n\n".join(notes) + revision_context
     raw = ai_request(FINAL_ANALYSIS_INSTRUCTIONS, input_text, json_output=True, max_tokens=6000)
     try:
-        return parse_json_object(raw), len(notes), False
+        return validate_analysis(parse_json_object(raw)), len(notes), False
     except ValueError:
         retry = FINAL_ANALYSIS_INSTRUCTIONS + "\n上一次输出未能解析。此次请进一步缩短每个数组为 2 项，每项不超过 70 字，确保 JSON 完整闭合。"
         retry_raw = ai_request(retry, input_text, json_output=True, max_tokens=5000)
-        return parse_json_object(retry_raw), len(notes), True
+        return validate_analysis(parse_json_object(retry_raw)), len(notes), True
 
 
 def parse_json_object(raw):
@@ -781,7 +1007,7 @@ def gutenberg_bytes(url, max_bytes=MAX_UPLOAD):
     parsed = urlparse(url)
     if parsed.scheme != "https" or not (parsed.hostname == "gutenberg.org" or parsed.hostname == GUTENBERG_HOST or (parsed.hostname or "").endswith(".gutenberg.org")):
         raise ValueError("在线书库返回了不受信任的下载地址。")
-    request = urllib.request.Request(url, headers={"User-Agent": "YuejianReader/1.1 (+local ebook reader)", "Accept": "application/atom+xml,application/epub+zip,*/*;q=0.8"})
+    request = urllib.request.Request(url, headers={"User-Agent": f"YuejianReader/{VERSION} (+local ebook reader)", "Accept": "application/atom+xml,application/epub+zip,*/*;q=0.8"})
     try:
         with urllib.request.urlopen(request, timeout=40) as response:
             final_host = urlparse(response.geturl()).hostname or ""
@@ -868,8 +1094,8 @@ def wikisource_json(params, max_bytes=2 * 1024 * 1024):
     query = "&".join(f"{quote_plus(str(key))}={quote_plus(str(value))}" for key, value in params.items())
     url = f"https://{WIKISOURCE_HOST}/w/api.php?{query}"
     headers = {
-        "User-Agent": "YuejianReader/1.1 (interactive desktop application; user-initiated free-text requests)",
-        "Api-User-Agent": "YuejianReader/1.1 WikimediaSourceSearch",
+        "User-Agent": f"YuejianReader/{VERSION} (interactive desktop application; user-initiated free-text requests)",
+        "Api-User-Agent": f"YuejianReader/{VERSION} WikimediaSourceSearch",
         "Accept": "application/json",
         "Accept-Language": "zh-CN,zh;q=0.9",
     }
@@ -980,10 +1206,253 @@ def download_catalog(catalog_id):
     raise ValueError("不支持的在线书库来源。")
 
 
+def parse_multipart(content_type, body, field_name):
+    """Parse one multipart field without the removed stdlib cgi module."""
+    if "multipart/form-data" not in content_type.lower():
+        raise ValueError("请求不是有效的文件上传。")
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+    )
+    if not message.is_multipart():
+        raise ValueError("文件上传格式无效。")
+    for part in message.iter_parts():
+        if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == field_name:
+            filename = part.get_filename() or ""
+            data = part.get_payload(decode=True) or b""
+            return filename, data
+    raise ValueError("没有接收到所需文件。")
+
+
+def storage_status():
+    categories = {"books": 0, "covers": 0, "analysis": 0, "settings": 0, "logs": 0}
+    for path in APP_DATA_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if LIBRARY_DIR in path.parents:
+            categories["covers" if "-cover." in path.name else "books"] += size
+        elif path == CACHE_FILE or path == CHUNK_CACHE_FILE:
+            categories["analysis"] += size
+        elif "logs" in path.parts:
+            categories["logs"] += size
+        else:
+            categories["settings"] += size
+    return {"categories": categories, "total": sum(categories.values()), "sessions": len(SESSIONS)}
+
+
+def delete_library_book(book_hash):
+    if not re.fullmatch(r"[a-f0-9]{64}", book_hash):
+        raise ValueError("书籍标识无效。")
+    removed = {}
+
+    def update_library(library):
+        nonlocal removed
+        library = library if isinstance(library, dict) else {}
+        removed = library.pop(book_hash, {})
+        return library
+
+    update_json(LIBRARY_FILE, {}, update_library)
+    if not removed:
+        raise ValueError("书架中没有找到这本书。")
+    for name in (removed.get("stored_name", ""), removed.get("cover_name", "")):
+        if name and Path(name).name == name:
+            try:
+                (LIBRARY_DIR / name).unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("failed to remove library file %s", name)
+
+    def update_cache(cache):
+        cache = cache if isinstance(cache, dict) else {}
+        cache.pop(book_hash, None)
+        return cache
+
+    update_json(CACHE_FILE, {}, update_cache)
+    update_json(
+        CHUNK_CACHE_FILE,
+        {},
+        lambda cache: {
+            key: value
+            for key, value in (cache.items() if isinstance(cache, dict) else [])
+            if value.get("book_hash") != book_hash
+        },
+    )
+    return {"deleted": True, "title": removed.get("title", "未命名书籍")}
+
+
+def clear_analysis_data(book_hash=""):
+    if book_hash and not re.fullmatch(r"[a-f0-9]{64}", book_hash):
+        raise ValueError("书籍标识无效。")
+
+    def update(cache):
+        cache = cache if isinstance(cache, dict) else {}
+        if book_hash:
+            cache.pop(book_hash, None)
+            return cache
+        return {}
+
+    cache = update_json(CACHE_FILE, {}, update)
+    if book_hash:
+        update_json(
+            CHUNK_CACHE_FILE,
+            {},
+            lambda chunks: {
+                key: value
+                for key, value in (chunks.items() if isinstance(chunks, dict) else [])
+                if value.get("book_hash") != book_hash
+            },
+        )
+    else:
+        write_json(CHUNK_CACHE_FILE, {})
+    return {"cleared": True, "remaining": len(cache)}
+
+
+BACKUP_JSON_FILES = {
+    "library.json": LIBRARY_FILE,
+    "analysis-cache.json": CACHE_FILE,
+    "analysis-timings.json": TIMING_FILE,
+    "analysis-chunks.json": CHUNK_CACHE_FILE,
+    "ui-state.json": UI_STATE_FILE,
+}
+
+
+def create_backup():
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps({"product": "Yuejian", "version": VERSION, "created_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False))
+        for name, path in BACKUP_JSON_FILES.items():
+            if path.exists():
+                archive.write(path, f"data/{name}")
+        for path in LIBRARY_DIR.iterdir():
+            if path.is_file() and re.fullmatch(r"[a-f0-9]{64}(?:\.(?:epub|txt)|-cover\.(?:jpg|png|webp|gif))", path.name):
+                archive.write(path, f"library/{path.name}")
+    return output.getvalue()
+
+
+def restore_backup(data):
+    if len(data) > 100 * 1024 * 1024:
+        raise ValueError("备份文件不能超过 100MB。")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as error:
+        raise ValueError("这不是有效的阅见备份文件。") from error
+    with archive:
+        infos = archive.infolist()
+        if sum(max(0, item.file_size) for item in infos) > 500 * 1024 * 1024:
+            raise ValueError("备份解压后的内容过大。")
+        names = {item.filename for item in infos}
+        if "manifest.json" not in names:
+            raise ValueError("备份缺少阅见清单。")
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        if manifest.get("product") != "Yuejian":
+            raise ValueError("备份来源无法识别。")
+        for name, target in BACKUP_JSON_FILES.items():
+            member = f"data/{name}"
+            if member in names:
+                parsed = json.loads(archive.read(member).decode("utf-8"))
+                write_json(target, parsed)
+        for info in infos:
+            if not info.filename.startswith("library/"):
+                continue
+            name = posixpath.basename(info.filename)
+            if re.fullmatch(r"[a-f0-9]{64}(?:\.(?:epub|txt)|-cover\.(?:jpg|png|webp|gif))", name):
+                atomic_write_bytes(LIBRARY_DIR / name, archive.read(info))
+    return {"restored": True, "books": len(load_library())}
+
+
+def diagnostic_report():
+    return {
+        "app_version": VERSION,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "secure_storage": os.name == "nt",
+        "ai": {"configured": bool(AI_CONFIG["key"]), "provider": AI_CONFIG["provider"], "model": AI_CONFIG["model"]},
+        "storage": storage_status(),
+        "paths": {"data_dir": str(APP_DATA_DIR), "root": str(ROOT)},
+    }
+
+
+def book_resource(book_hash, resource_path):
+    if not re.fullmatch(r"[a-f0-9]{64}", book_hash):
+        raise ValueError("书籍标识无效。")
+    normalized = posixpath.normpath(unquote(resource_path)).lstrip("/")
+    if normalized.startswith("../") or not normalized:
+        raise ValueError("书籍资源路径无效。")
+    entry = load_library().get(book_hash, {})
+    stored_name = entry.get("stored_name", "")
+    if not re.fullmatch(r"[a-f0-9]{64}\.epub", stored_name):
+        raise ValueError("书籍资源不存在。")
+    with zipfile.ZipFile(LIBRARY_DIR / stored_name) as archive:
+        try:
+            info = archive.getinfo(normalized)
+        except KeyError as error:
+            raise ValueError("书籍资源不存在。") from error
+        content_type = mimetypes.guess_type(normalized)[0] or "application/octet-stream"
+        if not content_type.startswith("image/") or info.file_size > 8 * 1024 * 1024:
+            raise ValueError("不支持读取该书籍资源。")
+        return archive.read(info), content_type
+
+
 class App(SimpleHTTPRequestHandler):
+    access_token = ""
+
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         super().end_headers()
+
+    def log_message(self, fmt, *args):
+        LOGGER.info("%s %s", self.address_string(), fmt % args)
+
+    def valid_host(self):
+        host = self.headers.get("Host", "")
+        parsed = urlparse(f"//{host}")
+        return parsed.hostname in ("127.0.0.1", "localhost", "::1")
+
+    def supplied_token(self):
+        header = self.headers.get("X-Yuejian-Token", "")
+        if header:
+            return header
+        cookies = self.headers.get("Cookie", "")
+        for item in cookies.split(";"):
+            name, separator, value = item.strip().partition("=")
+            if separator and name == "yuejian_session":
+                return value
+        return parse_qs(urlparse(self.path).query).get("token", [""])[0]
+
+    def valid_origin(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        parsed = urlparse(origin)
+        return parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+
+    def authorize_api(self):
+        if not self.valid_host() or not self.valid_origin():
+            self.send_json(403, {"error": "请求来源无效。"})
+            return False
+        if not self.access_token or not secrets.compare_digest(self.supplied_token(), self.access_token):
+            self.send_json(401, {"error": "本地会话令牌无效，请重新启动阅见。"})
+            return False
+        return True
+
+    def read_body(self, max_bytes=MAX_JSON_BODY):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("请求长度无效。") from error
+        if length <= 0 or length > max_bytes:
+            raise ValueError("请求内容大小无效。")
+        return self.rfile.read(length)
+
+    def read_json(self, max_bytes=MAX_JSON_BODY):
+        return json.loads(self.read_body(max_bytes).decode("utf-8"))
 
     def send_json(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -993,26 +1462,42 @@ class App(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_download(self, filename, body, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_static(self, path, set_cookie=False):
+        if not path.is_file() or ROOT not in path.resolve().parents and path.resolve() != ROOT.resolve():
+            self.send_error(404)
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        if set_cookie:
+            self.send_header("Set-Cookie", f"yuejian_session={self.access_token}; HttpOnly; SameSite=Strict; Path=/")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
+        if not self.authorize_api():
+            return
         try:
             if self.path == "/api/ui-state":
-                length = int(self.headers.get("Content-Length", 0))
-                if length <= 0 or length > MAX_UI_STATE:
-                    raise ValueError("界面设置数据大小无效。")
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                saved = save_ui_state(payload.get("state", {}))
+                payload = self.read_json(MAX_UI_STATE)
+                saved = patch_ui_state(payload["patch"]) if "patch" in payload else save_ui_state(payload.get("state", {}))
                 self.send_json(200, {"saved": True, "items": len(saved)})
                 return
             if self.path == "/api/quotes/parse":
-                length = int(self.headers.get("Content-Length", 0))
-                if length > 200_000:
-                    raise ValueError("批量名言内容过大。")
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = self.read_json(200_000)
                 self.send_json(200, {"quotes": parse_quotes_with_ai(str(payload.get("text", "")))})
                 return
             if self.path == "/api/config":
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = self.read_json(16_000)
                 model = str(payload.get("model", "")).strip()
                 provider = str(payload.get("provider", "openai")).strip().lower()
                 entered_key = str(payload.get("api_key", "")).strip()
@@ -1043,20 +1528,14 @@ class App(SimpleHTTPRequestHandler):
                 self.send_json(200, {"configured": True, "provider": AI_CONFIG["provider"], "model": AI_CONFIG["model"], "verification": verification[:80], "saved": True})
                 return
             if self.path == "/api/prepare":
-                if int(self.headers.get("Content-Length", 0)) > MAX_UPLOAD:
-                    raise ValueError("文件超过 30MB 限制。")
-                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type", "")})
-                item = form["book"] if "book" in form else None
-                if item is None or getattr(item, "file", None) is None:
-                    raise ValueError("没有接收到书籍文件。")
-                data = item.file.read(MAX_UPLOAD + 1)
+                body = self.read_body(MAX_UPLOAD + 1024 * 1024)
+                filename, data = parse_multipart(self.headers.get("Content-Type", ""), body, "book")
                 if len(data) > MAX_UPLOAD:
                     raise ValueError("文件超过 30MB 限制。")
-                self.send_json(200, prepare_book_payload(item.filename, data))
+                self.send_json(200, prepare_book_payload(filename, data))
                 return
             if self.path == "/api/library/open":
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = self.read_json(16_000)
                 book_hash = str(payload.get("book_hash", ""))
                 entry = load_library().get(book_hash)
                 if not entry or not re.fullmatch(r"[a-f0-9]{64}\.(?:epub|txt)", entry.get("stored_name", "")):
@@ -1067,14 +1546,35 @@ class App(SimpleHTTPRequestHandler):
                 self.send_json(200, prepare_book_payload(entry.get("original_name", path.name), path.read_bytes()))
                 return
             if self.path == "/api/catalog/download":
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = self.read_json(16_000)
                 self.send_json(200, download_catalog(str(payload.get("book_id", ""))))
                 return
+            if self.path == "/api/library/delete":
+                payload = self.read_json(16_000)
+                self.send_json(200, delete_library_book(str(payload.get("book_hash", ""))))
+                return
+            if self.path == "/api/cache/clear":
+                payload = self.read_json(16_000)
+                self.send_json(200, clear_analysis_data(str(payload.get("book_hash", ""))))
+                return
+            if self.path == "/api/data/restore":
+                body = self.read_body(101 * 1024 * 1024)
+                _, data = parse_multipart(self.headers.get("Content-Type", ""), body, "backup")
+                self.send_json(200, restore_backup(data))
+                return
+            if self.path == "/api/analyze/cancel":
+                payload = self.read_json(16_000)
+                session_id = str(payload.get("session_id", ""))
+                with ACTIVE_ANALYSES_LOCK:
+                    event = ACTIVE_ANALYSES.get(session_id)
+                if event:
+                    event.set()
+                self.send_json(200, {"cancelled": bool(event)})
+                return
             if self.path == "/api/analyze":
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                session = SESSIONS.get(payload.get("session_id"))
+                payload = self.read_json(16_000)
+                session_id = str(payload.get("session_id", ""))
+                session = SESSIONS.get(session_id)
                 if not session:
                     raise ValueError("书籍会话已失效，请重新上传。")
                 previous = load_analysis_cache().get(session["book_hash"])
@@ -1083,10 +1583,18 @@ class App(SimpleHTTPRequestHandler):
                     self.send_json(200, {"analysis": previous["analysis"], "cached": True, "cache_meta": {key: previous.get(key) for key in ("provider", "model", "analyzed_at", "revision_count")}})
                     return
                 analysis_started = time.perf_counter()
+                cancel_event = threading.Event()
+                session["_cancel_event"] = cancel_event
+                with ACTIVE_ANALYSES_LOCK:
+                    ACTIVE_ANALYSES[session_id] = cancel_event
                 try:
                     analysis, chunk_count, format_retry = make_chunked_analysis(session, previous if revision else None)
-                except ValueError:
-                    raise ValueError("分段阅读完成前未能生成完整报告。原有分析已保留；请稍后重试，软件会从章节分段重新汇总。")
+                except ValueError as error:
+                    raise ValueError(f"分段阅读完成前未能生成完整报告。原有分析已保留；{error}")
+                finally:
+                    session.pop("_cancel_event", None)
+                    with ACTIVE_ANALYSES_LOCK:
+                        ACTIVE_ANALYSES.pop(session_id, None)
                 analysis["schema_version"] = 2
                 session["analysis"] = analysis
                 revision_count = (int(previous.get("revision_count", 0)) + 1) if revision and previous else 0
@@ -1096,8 +1604,7 @@ class App(SimpleHTTPRequestHandler):
                 self.send_json(200, {"analysis": analysis, "cached": False, "actual_seconds": round(actual_seconds, 1), "timing_samples": timing_samples, "format_retry": format_retry, "chunk_count": chunk_count, "cache_meta": {key: cache_meta.get(key) for key in ("provider", "model", "analyzed_at", "revision_count")}})
                 return
             if self.path == "/api/question":
-                length = int(self.headers.get("Content-Length", 0))
-                data = json.loads(self.rfile.read(length).decode("utf-8"))
+                data = self.read_json(200_000)
                 session = SESSIONS.get(data.get("session_id"))
                 question = str(data.get("question", "")).strip()
                 if not session or not question:
@@ -1109,18 +1616,40 @@ class App(SimpleHTTPRequestHandler):
         except (ValueError, zipfile.BadZipFile, KeyError) as error:
             self.send_json(400, {"error": str(error)})
         except Exception as error:
-            self.send_json(500, {"error": f"处理失败：{error}"})
+            request_id = secrets.token_hex(4)
+            LOGGER.exception("request %s failed: %s", request_id, error)
+            self.send_json(500, {"error": f"处理失败，请稍后重试。诊断编号：{request_id}"})
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if not self.valid_host():
+            self.send_json(403, {"error": "请求主机无效。"})
+            return
+        if parsed.path in ("/", "/index.html"):
+            if not self.access_token or not secrets.compare_digest(self.supplied_token(), self.access_token):
+                self.send_json(401, {"error": "请通过阅见桌面程序或启动脚本打开页面。"})
+                return
+            self.send_static(ROOT / "index.html", set_cookie=True)
+            return
+        if parsed.path.startswith("/api/") and not self.authorize_api():
+            return
         if parsed.path == "/api/health":
-            self.send_json(200, {"version": "1.1", "service": "yuejian"})
+            self.send_json(200, {"version": VERSION, "service": "yuejian"})
             return
         if parsed.path == "/api/config-status":
             self.send_json(200, {"configured": bool(AI_CONFIG["key"]), "provider": AI_CONFIG["provider"], "model": AI_CONFIG["model"], "secure_storage": os.name == "nt"})
             return
         if parsed.path == "/api/ui-state":
             self.send_json(200, {"state": load_ui_state()})
+            return
+        if parsed.path == "/api/storage/status":
+            self.send_json(200, storage_status())
+            return
+        if parsed.path == "/api/diagnostics":
+            self.send_json(200, diagnostic_report())
+            return
+        if parsed.path == "/api/data/backup":
+            self.send_download(f"yuejian-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip", create_backup(), "application/zip")
             return
         if parsed.path == "/api/catalog/search":
             query = parse_qs(parsed.query).get("q", [""])[0].strip()
@@ -1135,7 +1664,9 @@ class App(SimpleHTTPRequestHandler):
             except ValueError as error:
                 self.send_json(400, {"error": str(error)})
             except Exception as error:
-                self.send_json(500, {"error": f"在线书库搜索失败：{error}"})
+                request_id = secrets.token_hex(4)
+                LOGGER.exception("catalog request %s failed: %s", request_id, error)
+                self.send_json(500, {"error": f"在线书库搜索失败。诊断编号：{request_id}"})
             return
         if parsed.path == "/api/library":
             cache = load_analysis_cache()
@@ -1164,6 +1695,19 @@ class App(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path == "/api/book/resource":
+            query = parse_qs(parsed.query)
+            try:
+                body, content_type = book_resource(query.get("book_hash", [""])[0], query.get("path", [""])[0])
+            except (ValueError, zipfile.BadZipFile, OSError):
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path == "/api/chapter":
             query = parse_qs(parsed.query)
             session = SESSIONS.get(query.get("session_id", [""])[0])
@@ -1177,22 +1721,35 @@ class App(SimpleHTTPRequestHandler):
             chapter = session["chapters"][index]
             self.send_json(200, {"title": chapter["title"], "text": chapter["text"], "html": chapter.get("html", reader_html(chapter["text"])), "index": index, "total": len(session["chapters"])})
             return
-        super().do_GET()
+        if re.fullmatch(r"/assets/[A-Za-z0-9_.-]+", parsed.path):
+            self.send_static(ROOT / parsed.path.lstrip("/"))
+            return
+        self.send_error(404)
+
+
+def app_handler(access_token):
+    """Create an isolated handler class for one application launch."""
+    class AuthenticatedApp(App):
+        pass
+
+    AuthenticatedApp.access_token = access_token
+    return AuthenticatedApp
 
 
 if __name__ == "__main__":
     os.chdir(ROOT)
     preferred_port = int(os.environ.get("PORT", "8001"))
+    access_token = secrets.token_urlsafe(32)
     server = None
     for port in range(preferred_port, preferred_port + 10):
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", port), App)
+            server = ThreadingHTTPServer(("127.0.0.1", port), app_handler(access_token))
             break
         except OSError:
             continue
     if server is None:
         raise OSError(f"端口 {preferred_port}-{preferred_port + 9} 均不可用。")
-    url = f"http://127.0.0.1:{server.server_address[1]}"
+    url = f"http://127.0.0.1:{server.server_address[1]}/?{urlencode({'token': access_token})}"
     print(f"阅见已启动：{url}")
     if os.environ.get("NO_BROWSER") != "1":
         webbrowser.open(url)
