@@ -20,7 +20,7 @@ final class SyncContract {
     static final int PROTOCOL_VERSION = 1;
     static JSONObject capabilities() throws Exception {
         return new JSONObject().put("protocol", "yuejian-sync-v1").put("protocolVersion", PROTOCOL_VERSION)
-                .put("mode", "local").put("accountEnabled", false).put("serverOptional", true)
+                .put("mode", "local").put("accountEnabled", true).put("serverOptional", true)
                 .put("exchangeEndpoint", "/api/v1/sync/exchange")
                 .put("supportsAcknowledgement", true).put("supportsTombstones", true).put("idempotencyKey", "changeId")
                 .put("blobEndpoints", new JSONArray().put("HEAD /api/v1/blobs/{sha256}").put("GET /api/v1/blobs/{sha256}").put("PUT /api/v1/blobs/{sha256}"))

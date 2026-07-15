@@ -11,6 +11,9 @@ build/
 dist/
 release-assets/
 reader.spec
+Yuejian-Reader-*.spec
+Yuejian-Sync-Server.spec
+/阅见同步服务器.exe
 
 # Android local toolchains, caches and signed artifacts
 android/.gradle/

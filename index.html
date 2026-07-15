@@ -11,7 +11,7 @@
       <header class="top">
         <div class="brand">
           <div class="brand-mark">阅</div>
-          阅见 <small id="brandSub">你的 AI 阅读伙伴 · v1.2</small>
+          阅见 <small id="brandSub">你的 AI 阅读伙伴 · v1.4</small>
         </div>
         <div class="actions">
           <button class="ghost" id="readingReportButton">阅读报告</button
@@ -309,6 +309,25 @@
           <p class="hint">
             图片会裁剪压缩后保存在本机。此资料以后可升级为软件登录账户。
           </p>
+          <section class="account-sync-card" id="accountSyncCard">
+            <div class="account-sync-head">
+              <div><b>账户与同步</b><small id="accountModeText">正在读取状态…</small></div>
+              <span class="sync-status-badge local" id="accountSyncBadge">本地模式</span>
+            </div>
+            <p class="hint">不登录也可以完整使用阅见。服务器关闭时继续使用本地数据，下次服务器开启后会自动补同步；AI 密钥不会同步。</p>
+            <div id="desktopSyncProgress" class="desktop-sync-progress" hidden><div><b id="desktopSyncPhase">准备同步…</b><span id="desktopSyncPercent">0%</span></div><div class="desktop-progress-track"><i id="desktopSyncBar"></i></div><p id="desktopSyncCounts">正在统计需要同步的数据…</p></div>
+            <div id="accountLoginFields" class="account-login-fields">
+              <div class="account-field-row">
+                <label>用户名<input id="accountUsername" maxlength="40" autocomplete="username" /></label>
+                <label>密码<input id="accountPassword" type="password" maxlength="200" autocomplete="current-password" /></label>
+              </div>
+              <div class="account-actions"><button type="button" id="accountRegister">注册新账户</button><button type="button" class="save" id="accountLogin">登录并同步</button></div>
+            </div>
+            <div id="accountConnectedActions" class="account-connected-actions" hidden>
+              <div id="accountSyncDetails" class="account-sync-details"></div>
+              <div class="account-actions"><button type="button" class="save" id="syncNow">立即同步</button><button type="button" id="accountLogout">退出登录并保持本地数据</button></div>
+            </div>
+          </section>
           <div class="modal-actions">
             <button class="cancel" id="cancelProfile">取消</button
             ><button class="save" id="saveProfile">保存资料</button>

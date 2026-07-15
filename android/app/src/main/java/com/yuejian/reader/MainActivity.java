@@ -2,8 +2,12 @@ package com.yuejian.reader;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
@@ -17,6 +21,10 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.ValueCallback;
 import android.widget.Toast;
+import android.view.ActionMode;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.View;
 import android.view.WindowInsetsController;
 
 import org.json.JSONObject;
@@ -29,6 +37,8 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MainActivity extends Activity {
@@ -39,17 +49,53 @@ public class MainActivity extends Activity {
     private WebView webView;
     private BookRepository repository;
     private SecureConfig secureConfig;
+    private AccountStore accountStore;
+    private SyncManager syncManager;
     private Uri pendingImportUri;
     private ValueCallback<Uri[]> webFileCallback;
     private final ExecutorService executor = Executors.newFixedThreadPool(3);
+    private final ScheduledExecutorService automaticSync = Executors.newSingleThreadScheduledExecutor();
+    private final AtomicBoolean automaticSyncStarted = new AtomicBoolean(false);
     private final Map<String, AtomicBoolean> aiJobs = new ConcurrentHashMap<>();
+
+    private static final class ReaderWebView extends WebView {
+        ReaderWebView(Context context) { super(context); }
+
+        @Override public ActionMode startActionMode(ActionMode.Callback callback) {
+            return startActionMode(callback, ActionMode.TYPE_FLOATING);
+        }
+
+        @Override public ActionMode startActionMode(ActionMode.Callback callback, int type) {
+            ActionMode.Callback2 quiet = new ActionMode.Callback2() {
+                @Override public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+                    boolean created = callback.onCreateActionMode(mode, menu);
+                    menu.clear();
+                    return created;
+                }
+                @Override public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+                    callback.onPrepareActionMode(mode, menu);
+                    menu.clear();
+                    return true;
+                }
+                @Override public boolean onActionItemClicked(ActionMode mode, MenuItem item) { return false; }
+                @Override public void onDestroyActionMode(ActionMode mode) { callback.onDestroyActionMode(mode); }
+                @Override public void onGetContentRect(ActionMode mode, View view, Rect outRect) {
+                    if (callback instanceof ActionMode.Callback2) ((ActionMode.Callback2) callback).onGetContentRect(mode, view, outRect);
+                    else super.onGetContentRect(mode, view, outRect);
+                }
+            };
+            return super.startActionMode(quiet, type);
+        }
+    }
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         repository = new BookRepository(this);
         secureConfig = new SecureConfig(this);
+        accountStore = new AccountStore(this);
+        syncManager = new SyncManager(repository, accountStore);
         if (Intent.ACTION_VIEW.equals(getIntent().getAction())) pendingImportUri = getIntent().getData();
-        webView = new WebView(this);
+        webView = new ReaderWebView(this);
         setContentView(webView);
         configureWebView();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -86,10 +132,20 @@ public class MainActivity extends Activity {
         });
         webView.setWebViewClient(new WebViewClient() {
             @Override public void onPageFinished(WebView view, String url) {
+                if (accountStore.accountMode()) executor.execute(() -> {
+                    try { notifySyncState(syncManager.syncNow(MainActivity.this::notifySyncProgress)); } catch (Exception ignored) {}
+                });
                 if (pendingImportUri != null) {
                     Uri uri = pendingImportUri;
                     pendingImportUri = null;
                     importUri(uri);
+                }
+                if (automaticSyncStarted.compareAndSet(false, true)) {
+                    automaticSync.scheduleAtFixedRate(() -> {
+                        if (!accountStore.accountMode()) return;
+                        try { notifySyncState(syncManager.syncNow(MainActivity.this::notifySyncProgress)); }
+                        catch (Exception ignored) {}
+                    }, 60, 60, TimeUnit.SECONDS);
                 }
             }
 
@@ -128,6 +184,14 @@ public class MainActivity extends Activity {
 
     private WebResourceResponse denied(int status, String reason) {
         return new WebResourceResponse("text/plain", "UTF-8", status, reason, Collections.emptyMap(), new ByteArrayInputStream(new byte[0]));
+    }
+
+    private void notifySyncState(JSONObject value) {
+        runOnUiThread(() -> webView.evaluateJavascript("window.features&&features.accountSyncFinished(" + JSONObject.quote(value.toString()) + ")", null));
+    }
+
+    private void notifySyncProgress(JSONObject value) {
+        runOnUiThread(() -> webView.evaluateJavascript("window.features&&features.accountSyncProgress(" + JSONObject.quote(value.toString()) + ")", null));
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -208,6 +272,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         executor.shutdownNow();
+        automaticSync.shutdownNow();
         if (webView != null) webView.destroy();
         repository.close();
         super.onDestroy();
@@ -281,8 +346,17 @@ public class MainActivity extends Activity {
         @JavascriptInterface public void readingStatsAsync(String requestId) { executor.execute(() -> { try { nativeResult(requestId, true, repository.readingStats()); } catch (Exception error) { nativeResult(requestId, false, message(error)); } }); }
         @JavascriptInterface public void recordReading(String bookId, long seconds, long chars, int completed) { repository.recordReading(bookId, seconds, chars, completed); }
         @JavascriptInterface public String syncChanges(long after, int limit) { try { return repository.syncChanges(after, limit).toString(); } catch (Exception error) { return errorJson(error); } }
-        @JavascriptInterface public String syncStatus() { try { return SyncContract.capabilities().put("pendingChanges", repository.syncChanges(0, 500).getJSONArray("changes").length()).toString(); } catch (Exception error) { return errorJson(error); } }
+        @JavascriptInterface public String syncStatus() { try { return syncManager.status().toString(); } catch (Exception error) { return errorJson(error); } }
         @JavascriptInterface public int acknowledgeSync(long cursor) { return repository.acknowledgeSync(cursor); }
+        @JavascriptInterface public void accountLoginAsync(String requestId, String serverUrl, String username, String password, boolean register) {
+            executor.execute(() -> { try { nativeResult(requestId, true, syncManager.login(serverUrl, username, password, register, "Android 手机", MainActivity.this::notifySyncProgress)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
+        }
+        @JavascriptInterface public void syncNowAsync(String requestId) {
+            executor.execute(() -> { try { nativeResult(requestId, true, syncManager.syncNow(MainActivity.this::notifySyncProgress)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
+        }
+        @JavascriptInterface public void accountLogoutAsync(String requestId) {
+            executor.execute(() -> { try { nativeResult(requestId, true, syncManager.logout()); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
+        }
         @JavascriptInterface public void setSystemTheme(boolean dark, String color) {
             runOnUiThread(() -> {
                 try { getWindow().setStatusBarColor(Color.parseColor(color)); getWindow().setNavigationBarColor(Color.parseColor(color)); }
@@ -302,7 +376,25 @@ public class MainActivity extends Activity {
         @JavascriptInterface public String aiStatus() { try { return secureConfig.status().toString(); } catch (Exception error) { return errorJson(error); } }
         @JavascriptInterface public String storageStatus() { try { return repository.storageStatus().toString(); } catch (Exception error) { return errorJson(error); } }
         @JavascriptInterface public void storageStatusAsync(String requestId) { executor.execute(() -> { try { nativeResult(requestId, true, repository.storageStatus()); } catch (Exception error) { nativeResult(requestId, false, message(error)); } }); }
+        @JavascriptInterface public void loadAnalysisAsync(String requestId, String bookId) { executor.execute(() -> { try { nativeResult(requestId, true, repository.loadAnalysis(bookId)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } }); }
         @JavascriptInterface public int clearAnalysis(String bookId) { return repository.clearAnalysis(bookId); }
+
+        @JavascriptInterface public void copyText(String text) {
+            runOnUiThread(() -> {
+                ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                clipboard.setPrimaryClip(ClipData.newPlainText("阅见摘录", text == null ? "" : text));
+                Toast.makeText(MainActivity.this, "已复制", Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        @JavascriptInterface public void shareText(String subject, String text) {
+            runOnUiThread(() -> {
+                Intent share = new Intent(Intent.ACTION_SEND).setType("text/plain")
+                        .putExtra(Intent.EXTRA_SUBJECT, subject == null ? "阅见摘录" : subject)
+                        .putExtra(Intent.EXTRA_TEXT, text == null ? "" : text);
+                startActivity(Intent.createChooser(share, "分享阅读书签"));
+            });
+        }
 
         @JavascriptInterface public void exportBackup() {
             runOnUiThread(() -> {
@@ -366,6 +458,19 @@ public class MainActivity extends Activity {
                     if (quote == null || quote.trim().isEmpty() || quote.length() > 8000) throw new IllegalArgumentException("请先选择需要解析的原文");
                     JSONObject book = repository.getBook(bookId);
                     nativeResult(requestId, true, AiClient.explain(secureConfig.load(), book.getString("title"), quote.trim()));
+                } catch (Exception error) { nativeResult(requestId, false, message(error)); }
+            });
+        }
+
+        @JavascriptInterface public void translateSelection(String requestId, String bookId, String quote) {
+            executor.execute(() -> {
+                try {
+                    if (quote == null || quote.trim().isEmpty() || quote.length() > 8000) throw new IllegalArgumentException("请先选择需要翻译的原文");
+                    String source = quote.trim();
+                    boolean mostlyChinese = source.codePoints().filter(c -> c >= 0x4E00 && c <= 0x9FFF).count() > Math.max(2, source.length() / 8);
+                    String target = mostlyChinese ? "英文" : "简体中文";
+                    String system = "你是专业文学翻译。把用户提供的原文完整翻译为" + target + "，保留段落、语气、专名与标点；只输出译文，不解释。";
+                    nativeResult(requestId, true, AiClient.request(secureConfig.load(), system, source, false, 5000));
                 } catch (Exception error) { nativeResult(requestId, false, message(error)); }
             });
         }

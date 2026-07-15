@@ -77,3 +77,14 @@ export async function initializePersistentStorage() {
     if (dirty) persist(true);
   });
 }
+
+export async function refreshPersistentStorage() {
+  const response = await fetch("/api/ui-state", { cache: "no-store" });
+  if (!response.ok) throw new Error("同步后的本地状态读取失败");
+  const state = (await response.json()).state || {};
+  Object.entries(state).forEach(([key, value]) => {
+    if (key.startsWith("yuejian-") && typeof value === "string")
+      nativeSet.call(localStorage, key, value);
+  });
+  return state;
+}

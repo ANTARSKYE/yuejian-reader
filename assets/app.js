@@ -1,10 +1,10 @@
 import { initializeAccessibility } from "./accessibility.js";
-import { initializePersistentStorage } from "./ui-storage.js";
+import { initializePersistentStorage, refreshPersistentStorage } from "./ui-storage.js";
 
 const launchParameters = new URLSearchParams(location.search);
 if (launchParameters.has("desktop")) {
   document.body.classList.add("desktop");
-  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.3.1";
+  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.4.3";
 }
 if (launchParameters.has("token"))
   history.replaceState(
@@ -462,6 +462,33 @@ function allReadingStats() {
     return {};
   }
 }
+function allLocalReadingContributions() {
+  try {
+    return JSON.parse(localStorage.getItem("yuejian-reading-contributions") || "{}");
+  } catch {
+    return {};
+  }
+}
+function addLocalReadingContribution(bookId, day, seconds, chars) {
+  const all = allLocalReadingContributions();
+  const book = all[bookId] || { daily: {}, dailyChars: {} };
+  book.daily = book.daily || {};
+  book.dailyChars = book.dailyChars || {};
+  book.daily[day] = (Number(book.daily[day]) || 0) + seconds;
+  book.dailyChars[day] = (Number(book.dailyChars[day]) || 0) + chars;
+  all[bookId] = book;
+  localStorage.setItem("yuejian-reading-contributions", JSON.stringify(all));
+}
+function allBookProgress() {
+  try { return JSON.parse(localStorage.getItem("yuejian-book-progress") || "{}"); }
+  catch { return {}; }
+}
+function saveCurrentBookProgress() {
+  if (!currentBookKey || !currentBookData?.chapters?.length) return;
+  const all = allBookProgress(), total = Math.max(1, currentBookData.chapters.length - 1);
+  all[currentBookKey] = { bookId: currentBookKey, chapter: currentChapterIndex, progress: Math.max(0, Math.min(1, currentChapterIndex / total)), updatedAt: Date.now() };
+  localStorage.setItem("yuejian-book-progress", JSON.stringify(all));
+}
 function bookStats() {
   const all = allReadingStats();
   return (
@@ -702,9 +729,6 @@ function selectParagraph(p, text = "", selection = window.getSelection()) {
   const toolbar = document.getElementById("selectionToolbar");
   if (toolbar) {
     toolbar.classList.toggle("show", !!selectedText);
-    document.getElementById("selectionPreview").textContent = selectedText
-      ? "已选择：" + selectedText.slice(0, 45)
-      : "选择一个段落或一段文字";
     if (selectedText) positionSelectionToolbar(selection);
   }
 }
@@ -909,6 +933,71 @@ function saveExactHighlight(color) {
   window.getSelection().removeAllRanges();
   selectParagraph(null, "");
 }
+async function copyTextToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const field = document.createElement("textarea");
+    field.value = text;
+    field.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+    document.body.appendChild(field);
+    field.select();
+    document.execCommand("copy");
+    field.remove();
+  }
+}
+function desktopChapterTitle(chapter = selectedLocator?.chapter ?? currentChapterIndex) {
+  const value = currentBookData?.chapters?.[chapter];
+  return typeof value === "string" ? value : value?.title || `第 ${chapter + 1} 章`;
+}
+async function copyDesktopSelection() {
+  if (!selectedText) return;
+  await copyTextToClipboard(selectedText);
+  showNotice("选中文字已复制。");
+}
+async function shareDesktopSelection() {
+  if (!selectedText) return;
+  const chapter = selectedLocator?.chapter ?? currentChapterIndex,
+    created = Date.now(),
+    item = { id: "share-" + created.toString(36), book: currentBookKey, title: currentBookData?.title || "未命名书籍", chapter, chapterTitle: desktopChapterTitle(chapter), quote: selectedText, created };
+  let items = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem("yuejian-share-bookmarks") || "[]");
+    if (Array.isArray(saved)) items = saved;
+  } catch {}
+  items.unshift(item);
+  localStorage.setItem("yuejian-share-bookmarks", JSON.stringify(items.slice(0, 300)));
+  const stamp = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(created)),
+    text = `《${item.title}》\n${item.chapterTitle}\n\n“${item.quote}”\n\n摘录于 阅见 · ${stamp}`;
+  if (navigator.share) {
+    try { await navigator.share({ title: `《${item.title}》阅读书签`, text }); return; } catch (error) { if (error.name === "AbortError") return; }
+  }
+  await copyTextToClipboard(text);
+  showNotice("分享书签已生成并复制，可直接粘贴分享。");
+}
+function selectWholeDesktopParagraph() {
+  const selection = window.getSelection(),
+    liveNode = selection.rangeCount ? selection.getRangeAt(0).commonAncestorContainer : null,
+    element = liveNode?.nodeType === 3 ? liveNode.parentElement : liveNode,
+    block = element?.closest?.("p,li,blockquote,h1,h2,h3,h4,h5,h6,figcaption,td,th") || selectedParagraph;
+  if (!block || !document.querySelector(".reader-body")?.contains(block)) return showNotice("当前位置没有可全选的段落。", true);
+  const range = document.createRange();
+  range.selectNodeContents(block); selection.removeAllRanges(); selection.addRange(range);
+  selectParagraph(block, selection.toString().trim(), selection);
+}
+async function translateDesktopSelection() {
+  if (!selectedText) return;
+  answer.innerHTML = "<b>正在翻译选段…</b>";
+  try {
+    const mostlyChinese = [...selectedText].filter((char) => /[\u4e00-\u9fff]/.test(char)).length > Math.max(2, selectedText.length / 8),
+      response = await fetch("/api/question", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, question: `请把下面原文完整翻译为${mostlyChinese ? "英文" : "简体中文"}，保留段落、语气、专名与标点，只输出译文，不解释：\n${selectedText}` }) }),
+      data = await response.json();
+    if (!response.ok) throw new Error(data.error || "翻译失败");
+    answer.innerHTML = "<b>选段翻译</b>" + escapeHtml(data.answer).replace(/\n/g, "<br>");
+  } catch (error) {
+    answer.innerHTML = "<b>暂时无法翻译</b>" + escapeHtml(error.message);
+  }
+}
 function openDesktopAnnotationList() {
   ensureAnnotationSheet();
   const items = readerMarks().filter((item) => item.book === currentBookKey && item.chapter === currentChapterIndex),
@@ -960,6 +1049,10 @@ function initReaderTools() {
   document.getElementById("markBlue").onclick = () => saveExactHighlight("blue");
   document.getElementById("markGreen").onclick = () => saveExactHighlight("green");
   document.getElementById("addNote").onclick = () => selectedText && openDesktopAnnotation();
+  document.getElementById("copySelection").onclick = copyDesktopSelection;
+  document.getElementById("shareSelection").onclick = shareDesktopSelection;
+  document.getElementById("selectParagraph").onclick = selectWholeDesktopParagraph;
+  document.getElementById("translateSelection").onclick = translateDesktopSelection;
   document.getElementById("manageAnnotations").onclick = openDesktopAnnotationList;
   document.getElementById("aiExplain").onclick = explainSelection;
   document.getElementById("clearSelection").onclick = () =>
@@ -998,6 +1091,7 @@ function ensureReadingTimer() {
     stats.dailyChars = stats.dailyChars || {};
     stats.daily[today] = (stats.daily[today] || 0) + 5;
     stats.dailyChars[today] = (stats.dailyChars[today] || 0) + 42;
+    addLocalReadingContribution(currentBookKey, today, 5, 42);
     saveBookStats(stats);
   }, 5000);
 }
@@ -1023,7 +1117,10 @@ let desktopReaderFlow = localStorage.getItem("yuejian-desktop-reader-flow") || "
   desktopPageIndex = 0,
   desktopPageCount = 1,
   desktopPageStep = 1,
+  desktopLoadedFrom = 0,
   desktopLoadedThrough = 0,
+  desktopAppendLoading = false,
+  desktopPrependLoading = false,
   desktopChapterObserver = null,
   desktopPageResizeObserver = null;
 function desktopChapterSection(index, data, nodes = null) {
@@ -1041,15 +1138,38 @@ function desktopChapterSection(index, data, nodes = null) {
   return section;
 }
 async function appendDesktopChapter() {
-  if (desktopLoadedThrough >= currentBookData.chapters.length - 1) return;
-  const next = desktopLoadedThrough + 1,
-    response = await fetch("/api/chapter?session_id=" + encodeURIComponent(sessionId) + "&index=" + next),
-    data = await response.json();
-  if (!response.ok) return;
-  const body = document.querySelector(".reader-body"),
-    sentinel = body.querySelector(".desktop-chapter-sentinel");
-  body.insertBefore(desktopChapterSection(next, data), sentinel);
-  desktopLoadedThrough = next;
+  if (desktopAppendLoading || desktopLoadedThrough >= currentBookData.chapters.length - 1) return;
+  desktopAppendLoading = true;
+  try {
+    const next = desktopLoadedThrough + 1,
+      response = await fetch("/api/chapter?session_id=" + encodeURIComponent(sessionId) + "&index=" + next),
+      data = await response.json();
+    if (!response.ok) return;
+    const body = document.querySelector(".reader-body"),
+      sentinel = body.querySelector(".desktop-chapter-sentinel");
+    body.insertBefore(desktopChapterSection(next, data), sentinel);
+    desktopLoadedThrough = next;
+  } finally {
+    desktopAppendLoading = false;
+  }
+}
+async function prependDesktopChapter() {
+  if (desktopPrependLoading || desktopLoadedFrom <= 0) return;
+  desktopPrependLoading = true;
+  try {
+    const previous = desktopLoadedFrom - 1,
+      oldHeight = document.documentElement.scrollHeight,
+      response = await fetch("/api/chapter?session_id=" + encodeURIComponent(sessionId) + "&index=" + previous),
+      data = await response.json();
+    if (response.ok) {
+      const body = document.querySelector(".reader-body"), top = body.querySelector(".desktop-chapter-sentinel.top");
+      top.insertAdjacentElement("afterend", desktopChapterSection(previous, data));
+      desktopLoadedFrom = previous;
+      window.scrollBy(0, document.documentElement.scrollHeight - oldHeight);
+    }
+  } finally {
+    desktopPrependLoading = false;
+  }
 }
 function updateDesktopVisibleChapter() {
   const sections = [...document.querySelectorAll(".desktop-continuous-chapter")],
@@ -1061,8 +1181,15 @@ function updateDesktopVisibleChapter() {
   const index = Number(visible.dataset.chapter);
   if (index !== currentChapterIndex) {
     currentChapterIndex = index;
+    saveCurrentBookProgress();
+    document.querySelector(".reader-head h2").textContent = desktopChapterTitle(index);
+    document.querySelector(".toc-label").textContent = "第 " + (index + 1) + " / " + currentBookData.chapters.length + " 章";
+    document.getElementById("prevChapter").disabled = index === 0;
+    document.getElementById("nextChapter").disabled = index === currentBookData.chapters.length - 1;
     document.querySelectorAll(".chapters button").forEach((button) => button.classList.remove("active"));
-    document.querySelector('.chapters button[data-index="' + index + '"]')?.classList.add("active");
+    const active = document.querySelector('.chapters button[data-index="' + index + '"]');
+    active?.classList.add("active"); active?.scrollIntoView({ block: "nearest" });
+    updateCompleteButton();
   }
 }
 function setupDesktopReadingFlow(data) {
@@ -1105,21 +1232,35 @@ function setupDesktopReadingFlow(data) {
   }
   const currentNodes = [...body.childNodes];
   body.replaceChildren(desktopChapterSection(data.index, data, currentNodes));
-  desktopLoadedThrough = data.index;
-  const sentinel = document.createElement("div");
-  sentinel.className = "desktop-chapter-sentinel";
+  desktopLoadedFrom = data.index; desktopLoadedThrough = data.index;
+  const topSentinel = document.createElement("div"), sentinel = document.createElement("div");
+  topSentinel.className = "desktop-chapter-sentinel top";
+  topSentinel.textContent = data.index > 0 ? "继续向上阅读上一章" : "已到全书开头";
+  sentinel.className = "desktop-chapter-sentinel bottom";
   sentinel.textContent = data.index < data.total - 1 ? "正在准备下一章…" : "已读到全书末尾";
-  body.append(sentinel);
+  body.prepend(topSentinel); body.append(sentinel);
   desktopChapterObserver?.disconnect();
   desktopChapterObserver = new IntersectionObserver(async (entries) => {
-    if (!entries.some((entry) => entry.isIntersecting)) return;
-    await appendDesktopChapter();
-    sentinel.textContent = desktopLoadedThrough < data.total - 1 ? "继续向下阅读" : "已读到全书末尾";
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      if (entry.target.classList.contains("top")) {
+        await prependDesktopChapter();
+        topSentinel.textContent = desktopLoadedFrom > 0 ? "继续向上阅读上一章" : "已到全书开头";
+      } else {
+        await appendDesktopChapter();
+        sentinel.textContent = desktopLoadedThrough < data.total - 1 ? "继续向下阅读" : "已读到全书末尾";
+      }
+    }
   }, { rootMargin: "700px 0px" });
-  desktopChapterObserver.observe(sentinel);
-  window.addEventListener("scroll", updateDesktopVisibleChapter, { passive: true, once: true });
-  appendDesktopChapter();
-  document.getElementById("prevChapter").onclick = () => currentChapterIndex > 0 && loadChapter(currentChapterIndex - 1);
+  desktopChapterObserver.observe(topSentinel); desktopChapterObserver.observe(sentinel);
+  window.removeEventListener("scroll", updateDesktopVisibleChapter);
+  window.addEventListener("scroll", updateDesktopVisibleChapter, { passive: true });
+  prependDesktopChapter(); appendDesktopChapter();
+  document.getElementById("prevChapter").onclick = async () => {
+    let target = document.querySelector('.desktop-continuous-chapter[data-chapter="' + (currentChapterIndex - 1) + '"]');
+    if (!target) { await prependDesktopChapter(); target = document.querySelector('.desktop-continuous-chapter[data-chapter="' + (currentChapterIndex - 1) + '"]'); }
+    target?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
   document.getElementById("nextChapter").onclick = async () => {
     let target = document.querySelector('.desktop-continuous-chapter[data-chapter="' + (currentChapterIndex + 1) + '"]');
     if (!target) { await appendDesktopChapter(); target = document.querySelector('.desktop-continuous-chapter[data-chapter="' + (currentChapterIndex + 1) + '"]'); }
@@ -1134,18 +1275,26 @@ function updateDesktopPage(smooth = true) {
   });
   document.querySelector(".toc-label").textContent = "第 " + (currentChapterIndex + 1) + " / " + currentBookData.chapters.length + " 章 · 第 " + (desktopPageIndex + 1) + " / " + desktopPageCount + " 页";
 }
-function turnDesktopPage(direction) {
+async function turnDesktopPage(direction) {
   if (direction > 0 && desktopPageIndex < desktopPageCount - 1) desktopPageIndex++;
   else if (direction < 0 && desktopPageIndex > 0) desktopPageIndex--;
   else {
     const next = currentChapterIndex + direction;
-    if (next >= 0 && next < currentBookData.chapters.length) loadChapter(next);
+    if (next >= 0 && next < currentBookData.chapters.length) {
+      await loadChapter(next);
+      if (direction < 0) {
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        desktopPageIndex = Math.max(0, desktopPageCount - 1);
+        updateDesktopPage(false);
+      }
+    }
     return;
   }
   updateDesktopPage();
 }
 async function loadChapter(index) {
   currentChapterIndex = index;
+  saveCurrentBookProgress();
   readingActive = true;
   ensureReadingTimer();
   selectedParagraph = null;
@@ -1170,7 +1319,7 @@ async function loadChapter(index) {
       (data.index + 1) +
       " / " +
       data.total +
-      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><span id="selectionPreview">拖选文字后可精确批注或高亮</span><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
+      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><button id="copySelection">复制</button><button id="shareSelection">分享书签</button><button id="selectParagraph">段落全选</button><button id="translateSelection">翻译</button><i class="tool-divider"></i><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
       data.html +
       '</div><div class="reader-nav"><button id="prevChapter" ' +
       (data.index === 0 ? "disabled" : "") +
@@ -1492,6 +1641,8 @@ function render(data) {
   currentBookData = data;
   title.textContent = data.title;
   currentBookKey = data.book_hash || data.title;
+  const savedProgress = allBookProgress()[currentBookKey];
+  currentChapterIndex = Math.max(0, Math.min(data.chapters.length - 1, Number(savedProgress?.chapter) || 0));
   migrateLegacyBookData(data.title, currentBookKey);
   rememberReadingMeta(data);
   document.querySelector(".chapters").innerHTML =
@@ -1567,7 +1718,7 @@ function render(data) {
       (btn) => (btn.onclick = () => loadChapter(Number(btn.dataset.index))),
     );
   if (hasAnalysis) showAnalysis();
-  else loadChapter(0);
+  else loadChapter(currentChapterIndex);
   workspace.style.display = "grid";
   workspace.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -2993,14 +3144,134 @@ function applyLocalProfile() {
   updateProfilePreview();
 }
 applyLocalProfile();
+const accountModeText = document.getElementById("accountModeText"),
+  accountSyncBadge = document.getElementById("accountSyncBadge"),
+  accountLoginFields = document.getElementById("accountLoginFields"),
+  accountConnectedActions = document.getElementById("accountConnectedActions"),
+  accountSyncDetails = document.getElementById("accountSyncDetails");
+function syncTimeLabel(value) {
+  if (!value) return "尚未完成同步";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
+function renderAccountStatus(status = {}) {
+  const account = status.mode === "account";
+  accountLoginFields.hidden = account;
+  accountConnectedActions.hidden = !account;
+  accountSyncBadge.className = "sync-status-badge";
+  if (!account) {
+    accountSyncBadge.classList.add("local");
+    accountSyncBadge.textContent = "本地模式";
+    accountModeText.textContent = "数据只保存在这台电脑，不会访问同步服务器";
+    accountSyncDetails.textContent = "";
+    return;
+  }
+  const failed = Boolean(status.lastError), pending = Number(status.pendingChanges || 0);
+  accountSyncBadge.classList.add(failed ? "offline" : pending ? "offline" : "synced");
+  accountSyncBadge.textContent = failed ? "离线待同步" : pending ? `待同步 ${pending} 条` : "已同步";
+  accountModeText.textContent = `${status.username || "账户"} · 已连接独立同步服务器`;
+  const s=status.lastSyncSummary||{}, summary=(s.uploadedBooks||s.downloadedBooks||s.uploadedItems||s.downloadedItems)?`<br>上次结果：上传 ${s.uploadedBooks||0} 本书 / ${s.uploadedItems||0} 条信息，下载 ${s.downloadedBooks||0} 本书 / ${s.downloadedItems||0} 条信息`:'';
+  accountSyncDetails.innerHTML = `<b>${failed ? "本地数据安全保留" : "账户模式已启用"}</b><br>最近同步：${escapeHtml(syncTimeLabel(status.lastSyncAt))}<br>待同步：${pending} 条${summary}${failed ? `<br>状态：${escapeHtml(status.lastError)}` : ""}`;
+}
+let desktopSyncTimer;
+function startDesktopSyncProgress(label="正在同步账户数据") {
+  const box=document.getElementById("desktopSyncProgress"),phase=document.getElementById("desktopSyncPhase"),percent=document.getElementById("desktopSyncPercent"),bar=document.getElementById("desktopSyncBar"),counts=document.getElementById("desktopSyncCounts");
+  box.hidden=false; phase.textContent=label; counts.textContent="正在整理书架、阅读记录与批注…"; let value=6; bar.style.width=value+"%"; percent.textContent=value+"%"; clearInterval(desktopSyncTimer);
+  desktopSyncTimer=setInterval(()=>{value=Math.min(92,value+Math.max(1,Math.round((94-value)/7)));bar.style.width=value+"%";percent.textContent=value+"%";phase.textContent=value<30?"正在整理本机数据":value<65?"正在上传并交换阅读信息":"正在核对并下载远端书籍";},500);
+}
+function finishDesktopSyncProgress(result={},error="") {
+  clearInterval(desktopSyncTimer); const box=document.getElementById("desktopSyncProgress"),phase=document.getElementById("desktopSyncPhase"),percent=document.getElementById("desktopSyncPercent"),bar=document.getElementById("desktopSyncBar"),counts=document.getElementById("desktopSyncCounts");
+  phase.textContent=error?"同步未完成":"同步完成"; percent.textContent=error?"!":"100%"; bar.style.width="100%"; counts.textContent=error?error:`上传 ${result.uploadedBooks||result.uploadedBlobs||0} 本书 / ${result.uploadedItems||result.uploaded||0} 条信息 · 下载 ${result.downloadedBooks||result.downloadedBlobs||0} 本书 / ${result.downloadedItems||result.downloaded||0} 条信息`; if(!error)setTimeout(()=>box.hidden=true,4500);
+}
+async function accountApi(path, body = {}) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || "账户操作失败");
+  return result;
+}
+async function loadAccountStatus() {
+  try {
+    const response = await fetch("/api/account/status", { cache: "no-store" });
+    if (!response.ok) throw new Error("无法读取同步状态");
+    const status = await response.json();
+    renderAccountStatus(status);
+    if (status.username) document.getElementById("accountUsername").value = status.username;
+  } catch (error) {
+    accountModeText.textContent = error.message;
+    accountSyncBadge.className = "sync-status-badge error";
+    accountSyncBadge.textContent = "状态异常";
+  }
+}
+async function submitAccount(register) {
+  const serverUrl = "http://127.0.0.1:18787",
+    username = document.getElementById("accountUsername").value.trim(),
+    passwordField = document.getElementById("accountPassword"),
+    password = passwordField.value;
+  if (!username || password.length < 8) {
+    showNotice("请填写用户名和至少 8 位密码。", true);
+    return;
+  }
+  const buttons = [document.getElementById("accountLogin"), document.getElementById("accountRegister")];
+  buttons.forEach((button) => button.disabled = true);
+  startDesktopSyncProgress(register ? "正在注册并同步已有数据" : "正在登录并同步已有数据");
+  accountModeText.textContent = register ? "正在创建账户…" : "正在登录并交换本地数据…";
+  try {
+    const status = await accountApi(register ? "/api/account/register" : "/api/account/login", { serverUrl, username, password, deviceName: "Windows Desktop" });
+    passwordField.value = "";
+    renderAccountStatus(status);
+    finishDesktopSyncProgress(status.sync||{});
+    await refreshPersistentStorage();
+    applyLocalProfile();
+    showNotice(status.lastError ? "账户已登录，服务器暂时离线；本地数据会在下次连接时同步。" : "登录成功，多端阅读数据已同步。", Boolean(status.lastError));
+  } catch (error) {
+    finishDesktopSyncProgress({},error.message);
+    showNotice(error.message, true);
+    await loadAccountStatus();
+  } finally {
+    buttons.forEach((button) => button.disabled = false);
+  }
+}
+document.getElementById("accountLogin").onclick = () => submitAccount(false);
+document.getElementById("accountRegister").onclick = () => submitAccount(true);
+document.getElementById("syncNow").onclick = async () => {
+  const button = document.getElementById("syncNow");
+  button.disabled = true; button.textContent = "正在同步…";
+  startDesktopSyncProgress("正在同步账户数据");
+  try {
+    const result = await accountApi("/api/sync/now");
+    await refreshPersistentStorage();
+    applyLocalProfile();
+    await loadAccountStatus();
+    finishDesktopSyncProgress(result);
+    showNotice(`同步完成：上传 ${result.uploadedBlobs || 0} 本书 / ${result.uploaded || 0} 条信息，下载 ${result.downloadedBlobs || 0} 本书 / ${result.downloaded || 0} 条信息。`);
+  } catch (error) {
+    finishDesktopSyncProgress({},error.message);
+    showNotice(`${error.message}。本地数据已保留，服务器恢复后可继续同步。`, true);
+    await loadAccountStatus();
+  } finally {
+    button.disabled = false; button.textContent = "立即同步";
+  }
+};
+document.getElementById("accountLogout").onclick = async () => {
+  try {
+    renderAccountStatus(await accountApi("/api/account/logout"));
+    showNotice("已切换为本地模式，本机书籍和阅读数据均已保留。");
+  } catch (error) { showNotice(error.message, true); }
+};
 profileButton.onclick = () => {
   applyLocalProfile();
+  loadAccountStatus();
   openExclusiveModal(profileModal);
   setTimeout(() => {
     profileNameInput.focus();
     profileNameInput.select();
   }, 50);
 };
+loadAccountStatus();
 document.getElementById("cancelProfile").onclick = () =>
   profileModal.classList.remove("open");
 profileModal.addEventListener("click", (event) => {

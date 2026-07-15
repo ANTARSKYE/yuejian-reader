@@ -20,6 +20,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email import policy
 from email.parser import BytesParser
 from html import escape
@@ -32,11 +33,12 @@ from xml.etree import ElementTree as ET
 
 from ai_client import request as provider_ai_request
 from storage import atomic_write_bytes, configure_logging, read_json, update_json, write_json
+from sync_local import LocalSyncManager
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Yuejian"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.3.1"
+VERSION = "1.4.3"
 CACHE_FILE = APP_DATA_DIR / "analysis-cache.json"
 TIMING_FILE = APP_DATA_DIR / "analysis-timings.json"
 CHUNK_CACHE_FILE = APP_DATA_DIR / "analysis-chunks.json"
@@ -168,6 +170,10 @@ def load_ai_config():
 
 load_ai_config()
 
+SYNC_MANAGER = LocalSyncManager(
+    APP_DATA_DIR, UI_STATE_FILE, windows_protect, windows_unprotect
+)
+
 
 def load_library():
     data = read_json(LIBRARY_FILE, {})
@@ -206,7 +212,11 @@ def save_ui_state(state):
         if not isinstance(value, str) or len(value.encode("utf-8")) > 8 * 1024 * 1024:
             continue
         cleaned[key] = value
+    previous = load_ui_state()
     write_json(UI_STATE_FILE, cleaned)
+    patch = {key: value for key, value in cleaned.items() if previous.get(key) != value}
+    patch.update({key: None for key in previous if key not in cleaned})
+    SYNC_MANAGER.record_ui_patch(patch)
     return cleaned
 
 
@@ -225,7 +235,9 @@ def patch_ui_state(patch):
                 current[key] = value
         return current
 
-    return update_json(UI_STATE_FILE, {}, apply)
+    saved = update_json(UI_STATE_FILE, {}, apply)
+    SYNC_MANAGER.record_ui_patch(patch)
+    return saved
 
 
 def extract_epub_cover(data):
@@ -325,7 +337,8 @@ def remember_book(book_hash, original_name, title, data):
         }
         return library
 
-    update_json(LIBRARY_FILE, {}, update)
+    library = update_json(LIBRARY_FILE, {}, update)
+    SYNC_MANAGER.record_book(book_hash, library.get(book_hash, {}))
 
 
 def prepare_book_payload(name, data):
@@ -361,6 +374,7 @@ def persist_analysis(session, analysis, revision_count):
         return cache
 
     update_json(CACHE_FILE, {}, update)
+    SYNC_MANAGER.record_analysis(session["book_hash"], entry)
     return entry
 
 
@@ -726,16 +740,20 @@ def estimate_analysis(text, chapters):
     complexity_score = 1.25 if complexity == "高" else 1.1 if complexity == "中" else 1.0
     model_factor = 1.7 if AI_CONFIG["model"].endswith("pro") or AI_CONFIG["model"] == "gpt-5" else 1.0
     # 分段阅读会产生多次模型调用，按全文字符数给出更保守的预计时间。
-    baseline = (32 + len(text) / 1500) * model_factor * complexity_score
+    plan = analysis_chunk_plan(chapters)
+    chunk_calls = max(1, min(8, int(plan.get("estimated_calls", 1))))
+    workers = 3 if AI_CONFIG["model"].lower().endswith("flash") else 2
+    rounds = (chunk_calls + workers - 1) // workers + 1
+    baseline = rounds * 42 * model_factor * complexity_score
     samples = [x for x in load_timing_history() if x.get("provider") == AI_CONFIG["provider"] and x.get("model") == AI_CONFIG["model"] and x.get("seconds") and x.get("analysis_schema") == 2]
     if samples:
         target_chars = max(1, len(text))
         ranked = sorted(samples, key=lambda x: abs((x.get("chars", 1) - target_chars) / target_chars) + abs(x.get("chapters", 1) - len(chapters)) / max(4, len(chapters)))[:12]
         predictions = []
         for sample in ranked:
-            size_ratio = target_chars / max(1, sample.get("chars", target_chars))
+            size_ratio = min(4.0, target_chars / max(1, sample.get("chars", target_chars)))
             complexity_ratio = complexity_score / max(.5, sample.get("complexity_score", 1.0))
-            predictions.append(sample["seconds"] * (.35 + .65 * size_ratio) * complexity_ratio)
+            predictions.append(sample["seconds"] * (.45 + .18 * size_ratio) * complexity_ratio * max(.55, rounds / 5))
         learned = sum(predictions) / len(predictions)
         confidence = min(.85, .2 + len(samples) * .08)
         baseline = baseline * (1 - confidence) + learned * confidence
@@ -860,11 +878,18 @@ def build_analysis_chunks(chapters, target_chars=None):
     """以章节为边界分段；超长章节再切开，确保每次 AI 请求都可控。"""
     target_chars = target_chars or analysis_chunk_plan(chapters)["target_chars"]
     chunks, current, current_size = [], [], 0
+    raw_total = sum(len(str(chapter.get("text", ""))) for chapter in chapters)
+    maximum_input = target_chars * 8
+    per_chapter_budget = max(1200, int(maximum_input * .75 / max(1, len(chapters)))) if raw_total > maximum_input else 0
     for chapter in chapters:
         title = str(chapter.get("title", "未命名章节"))
         text = re.sub(r"\n{3,}", "\n\n", str(chapter.get("text", "")).strip())
         if not text:
             continue
+        if per_chapter_budget and len(text) > per_chapter_budget:
+            window = max(300, per_chapter_budget // 4)
+            points = (0, len(text) // 3, len(text) * 2 // 3, max(0, len(text) - window))
+            text = "\n[本章均匀取样]\n".join(text[point:point + window] for point in points)
         pieces = [text[i:i + target_chars] for i in range(0, len(text), target_chars)]
         for number, piece in enumerate(pieces, 1):
             heading = title if len(pieces) == 1 else f"{title}（第 {number}/{len(pieces)} 段）"
@@ -930,6 +955,47 @@ def build_chunk_notes(session):
             raise ValueError(f"第 {index}/{len(chunks)} 段没有返回阅读笔记，请重试。")
         notes.append(f"【分段 {index}/{len(chunks)}】\n{note[:1800]}")
     return notes
+
+
+def build_chunk_notes(session):
+    """Build at most eight sampled notes, reusing cache and parallelising independent calls."""
+    chunks = build_analysis_chunks(session["chapters"], session.get("chunk_target_chars"))
+    notes = [""] * len(chunks)
+    cached_notes = load_chunk_cache()
+    cancel_event = session.get("_cancel_event")
+    pending = []
+    for index, chunk in enumerate(chunks, 1):
+        if cancel_event and cancel_event.is_set():
+            raise ValueError("分析已取消；已经完成的分段笔记会保留。")
+        cache_key = chunk_cache_key(session, chunk)
+        cached = str(cached_notes.get(cache_key, {}).get("note", "")).strip()
+        if cached:
+            notes[index - 1] = cached[:1800]
+        else:
+            pending.append((index, chunk, cache_key))
+
+    def analyze_one(item):
+        index, chunk, cache_key = item
+        if cancel_event and cancel_event.is_set():
+            raise ValueError("分析已取消")
+        prompt = f"书名：{session['title']}\n分段：{index}/{len(chunks)}\n\n{chunk}"
+        try:
+            note = ai_request(CHUNK_NOTE_INSTRUCTIONS, prompt, max_tokens=1300).strip()
+        except ValueError as error:
+            raise ValueError(f"第 {index}/{len(chunks)} 段阅读失败：{error}") from error
+        if not note:
+            raise ValueError(f"第 {index}/{len(chunks)} 段没有返回阅读笔记，请重试。")
+        save_chunk_note(cache_key, note[:1800], session["book_hash"])
+        return index, note[:1800]
+
+    workers = min(len(pending), 3 if AI_CONFIG["model"].lower().endswith("flash") else 2)
+    if workers:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="analysis") as executor:
+            futures = [executor.submit(analyze_one, item) for item in pending]
+            for future in as_completed(futures):
+                index, note = future.result()
+                notes[index - 1] = note
+    return [f"【分段 {index}/{len(chunks)}】\n{note}" for index, note in enumerate(notes, 1)]
 
 
 def compact_previous_analysis(previous):
@@ -1287,6 +1353,7 @@ def delete_library_book(book_hash):
     update_json(LIBRARY_FILE, {}, update_library)
     if not removed:
         raise ValueError("书架中没有找到这本书。")
+    SYNC_MANAGER.record_book(book_hash, removed, deleted=True)
     for name in (removed.get("stored_name", ""), removed.get("cover_name", "")):
         if name and Path(name).name == name:
             try:
@@ -1300,6 +1367,7 @@ def delete_library_book(book_hash):
         return cache
 
     update_json(CACHE_FILE, {}, update_cache)
+    SYNC_MANAGER.record_analysis(book_hash, deleted=True)
     update_json(
         CHUNK_CACHE_FILE,
         {},
@@ -1323,7 +1391,13 @@ def clear_analysis_data(book_hash=""):
             return cache
         return {}
 
+    previous = load_analysis_cache()
     cache = update_json(CACHE_FILE, {}, update)
+    if book_hash:
+        SYNC_MANAGER.record_analysis(book_hash, deleted=True)
+    else:
+        for analysis_book_id in previous:
+            SYNC_MANAGER.record_analysis(analysis_book_id, deleted=True)
     if book_hash:
         update_json(
             CHUNK_CACHE_FILE,
@@ -1517,6 +1591,25 @@ class App(SimpleHTTPRequestHandler):
         if not self.authorize_api():
             return
         try:
+            if self.path in ("/api/account/login", "/api/account/register"):
+                payload = self.read_json(32_000)
+                result = SYNC_MANAGER.login(
+                    payload.get("serverUrl", ""), payload.get("username", ""),
+                    payload.get("password", ""),
+                    register=self.path.endswith("register"),
+                    device_name=payload.get("deviceName", "Windows Desktop"),
+                )
+                self.send_json(200, result)
+                return
+            if self.path == "/api/account/logout":
+                self.read_json(2_000)
+                self.send_json(200, SYNC_MANAGER.logout())
+                return
+            if self.path == "/api/sync/now":
+                self.read_json(2_000)
+                result = SYNC_MANAGER.run_sync_once()
+                self.send_json(200 if result.get("ok") or result.get("skipped") or result.get("busy") else 503, result)
+                return
             if self.path == "/api/ui-state":
                 payload = self.read_json(MAX_UI_STATE)
                 saved = patch_ui_state(payload["patch"]) if "patch" in payload else save_ui_state(payload.get("state", {}))
@@ -1668,6 +1761,9 @@ class App(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/config-status":
             self.send_json(200, {"configured": bool(AI_CONFIG["key"]), "provider": AI_CONFIG["provider"], "model": AI_CONFIG["model"], "secure_storage": os.name == "nt"})
+            return
+        if parsed.path in ("/api/account/status", "/api/sync/status"):
+            self.send_json(200, SYNC_MANAGER.status())
             return
         if parsed.path == "/api/ui-state":
             self.send_json(200, {"state": load_ui_state()})

@@ -2,6 +2,10 @@
   const A = window.app, F = window.features;
   if (!A || !F) return;
   if (!Yuejian.readingStatsAsync) Yuejian.readingStatsAsync = requestId => setTimeout(() => A.nativeResult(JSON.stringify({requestId, ok:true, result:parse(Yuejian.readingStats(), [])})), 20);
+  if (!Yuejian.syncStatus) Yuejian.syncStatus = () => JSON.stringify({mode:'local',pendingChanges:0,lastSyncAt:0,lastError:''});
+  if (!Yuejian.accountLoginAsync) Yuejian.accountLoginAsync = (requestId, serverUrl, username) => setTimeout(() => A.nativeResult(JSON.stringify({requestId,ok:true,result:{mode:'account',serverUrl,username,pendingChanges:0,lastSyncAt:Date.now(),lastError:''}})), 30);
+  if (!Yuejian.syncNowAsync) Yuejian.syncNowAsync = requestId => setTimeout(() => A.nativeResult(JSON.stringify({requestId,ok:true,result:{mode:'account',ok:true,uploaded:0,downloaded:0,pendingChanges:0}})), 30);
+  if (!Yuejian.accountLogoutAsync) Yuejian.accountLogoutAsync = requestId => setTimeout(() => A.nativeResult(JSON.stringify({requestId,ok:true,result:{mode:'local',pendingChanges:0}})), 30);
   const parse = (value, fallback) => { try { return JSON.parse(value); } catch { return fallback; } };
   const esc = value => A.escape(value ?? '');
   const readState = (key, fallback) => parse(Yuejian.getState(key, JSON.stringify(fallback)), fallback);
@@ -31,13 +35,37 @@
   const originalInit = F.init.bind(F);
   F.init = function () {
     originalInit();
+    A.showAbout = () => A.toast('阅见 Android 1.2.3 · AI 报告跨端同步');
     this.installReadingExperience();
     this.installAnnotationUi();
     this.installNavigationFeedback();
+    this.installAccountSync();
+    this.installBackgroundPicker();
+    this.installProfilePicker();
+  };
+
+  F.installBackgroundPicker = function () {
+    const input=document.getElementById('backgroundFile'); if(!input||document.getElementById('backgroundPicker'))return;
+    input.classList.add('background-file-native');
+    const picker=document.createElement('button'); picker.type='button'; picker.id='backgroundPicker'; picker.className='background-picker';
+    picker.innerHTML='<span class="background-picker-icon">▧</span><span><b>选择背景图片</b><small id="backgroundFileName">支持 JPG、PNG、WebP，自动压缩适配</small></span><em>浏览</em>';
+    input.insertAdjacentElement('afterend',picker); picker.onclick=()=>input.click();
+    input.addEventListener('change',()=>{const file=input.files?.[0];if(file)document.getElementById('backgroundFileName').textContent=file.name;});
+    const clear=document.getElementById('clearBackground'); if(clear){clear.classList.add('background-clear');clear.textContent='恢复主题默认背景';}
+  };
+
+  F.installProfilePicker = function () {
+    const input=document.getElementById('avatarFile'); if(!input||document.getElementById('avatarPicker'))return;
+    input.classList.add('profile-file-native');
+    const picker=document.createElement('button'); picker.type='button'; picker.id='avatarPicker'; picker.className='profile-picker';
+    picker.innerHTML='<span class="profile-picker-icon">◉</span><span><b>更换本地头像</b><small id="avatarFileName">选择 JPG、PNG 或 WebP 图片</small></span><em>选择图片</em>';
+    input.insertAdjacentElement('afterend',picker); picker.onclick=()=>input.click();
+    input.addEventListener('change',()=>{const file=input.files?.[0];if(file)document.getElementById('avatarFileName').textContent=file.name;});
   };
 
   F.installNavigationFeedback = function () {
     document.querySelectorAll('.app-nav button').forEach(button => {
+      button.onclick = event => { event.preventDefault(); this.showPage(button.dataset.page); };
       button.addEventListener('pointerdown', () => {
         button.classList.add('pressed');
         this.previewPage(button.dataset.page);
@@ -45,6 +73,7 @@
       }, {passive: true});
       button.addEventListener('pointerup', () => button.classList.remove('pressed'), {passive: true});
       button.addEventListener('pointercancel', () => button.classList.remove('pressed'), {passive: true});
+      button.addEventListener('touchend', event => { event.preventDefault(); button.classList.remove('pressed'); this.showPage(button.dataset.page); }, {passive:false});
     });
   };
   F.previewPage = function (page) {
@@ -57,10 +86,83 @@
   F.showPage = function (page) {
     this.previewPage(page);
     requestAnimationFrame(() => setTimeout(() => {
-      if (page === 'report') this.renderReport(this.reportScale || 'day');
-      if (page === 'catalog') this.renderSources();
-      if (page === 'profile') { this.loadSettings(); this.renderQuotes(); this.renderStorage(); }
+      try {
+        if (page === 'report') this.renderReport(this.reportScale || 'day');
+        if (page === 'catalog') this.renderSources();
+        if (page === 'profile') { this.loadSettings(); this.renderQuotes(); this.renderStorage(); this.renderAccountStatus(); }
+      } catch(error) {
+        const target=page==='report'?document.getElementById('reportContent'):page==='catalog'?document.getElementById('sourceGrid'):null;
+        if(target)target.innerHTML=`<div class="page-feedback error"><strong>页面加载失败</strong><span>${esc(error.message)}</span><button onclick="features.showPage('${page}')">重新打开</button></div>`;
+      }
     }, 0));
+  };
+
+  F.installAccountSync = function () {
+    const column = document.querySelector('#profilePage .settings-grid > div:first-child');
+    if (!column || document.getElementById('androidAccountPanel')) return;
+    const panel = document.createElement('div');
+    panel.id = 'androidAccountPanel'; panel.className = 'panel account-panel';
+    panel.innerHTML = `<div class="account-title"><div><h3>账户与同步</h3><p>不登录也可完整使用；服务器关闭时继续本地阅读。</p></div><span id="androidSyncBadge" class="account-badge local">本地模式</span></div>
+      <p class="panel-desc">登录后同步书架资料、进度、统计、批注、标记、书签和阅读偏好。AI 密钥不会同步。</p>
+      <div id="androidSyncProgress" class="account-sync-progress hidden"><div><b id="androidSyncPhase">准备同步…</b><span id="androidSyncPercent">0%</span></div><div class="account-progress-track"><i id="androidSyncProgressBar"></i></div><p id="androidSyncCounts">上传 0 本书 / 0 条信息 · 下载 0 本书 / 0 条信息</p></div>
+      <div id="androidAccountLogin"><p class="account-auto-discovery">先在电脑上双击“阅见同步服务器.exe”。手机与电脑处于同一 Wi-Fi 时会自动连接。</p><label class="field"><span>用户名</span><input id="androidUsername" maxlength="40" autocomplete="username"></label><label class="field"><span>密码（至少 8 位）</span><input id="androidPassword" type="password" maxlength="200" autocomplete="current-password"></label><div class="row wrap"><button class="small-action" id="androidRegister">注册</button><button class="action" id="androidLogin">登录并同步</button></div></div>
+      <div id="androidAccountConnected" hidden><div id="androidSyncDetails" class="account-details"></div><div class="row wrap"><button class="action" id="androidSyncNow">立即同步</button><button class="small-action" id="androidLogout">退出登录</button></div></div>`;
+    column.insertBefore(panel, column.querySelector('.panel:nth-child(2)'));
+    document.getElementById('androidLogin').onclick = () => this.submitAccount(false);
+    document.getElementById('androidRegister').onclick = () => this.submitAccount(true);
+    document.getElementById('androidSyncNow').onclick = () => this.syncAccountNow();
+    document.getElementById('androidLogout').onclick = async () => { try { this.applyAccountStatus(await nativeAsync('accountLogoutAsync')); A.toast('已切换为本地模式，本机数据已保留'); } catch(error) { A.toast(error.message); } };
+    this.renderAccountStatus();
+  };
+  F.renderAccountStatus = function () {
+    try { this.applyAccountStatus(parse(Yuejian.syncStatus(), {mode:'local'})); }
+    catch (error) { this.applyAccountStatus({mode:'local',lastError:error.message}); }
+  };
+  F.applyAccountStatus = function (status) {
+    const account = status?.mode === 'account', error = status?.lastError || status?.error || '', pendingCount = +(status?.pendingChanges || 0);
+    const login = document.getElementById('androidAccountLogin'), connected = document.getElementById('androidAccountConnected'), badge = document.getElementById('androidSyncBadge');
+    if (!login || !connected || !badge) return;
+    login.hidden = account; connected.hidden = !account;
+    const modeBadge=document.querySelector('#profilePage .sync-badge');
+    if(modeBadge)modeBadge.innerHTML=`<i></i>${!account?'本地模式':error?'账户模式 · 离线待同步':'账户模式 · 已连接'}`;
+    badge.className = 'account-badge ' + (!account ? 'local' : error || pendingCount ? 'offline' : 'synced');
+    badge.textContent = !account ? '本地模式' : error ? '离线待同步' : pendingCount ? `待同步 ${pendingCount} 条` : '已同步';
+    if (account) {
+      const s=status.lastSyncSummary||{}, summary=(s.uploadedBlobs||s.downloadedBlobs||s.uploaded||s.downloaded)?`<br>上次结果：上传 ${s.uploadedBlobs||0} 本书 / ${s.uploaded||0} 条信息，下载 ${s.downloadedBlobs||0} 本书 / ${s.downloaded||0} 条信息`:'';
+      document.getElementById('androidSyncDetails').innerHTML = `<b>${esc(status.username || '账户模式')}</b><br>最近同步：${status.lastSyncAt ? new Date(+status.lastSyncAt).toLocaleString('zh-CN') : '尚未完成'}<br>待同步：${pendingCount} 条${summary}${error ? `<br>状态：${esc(error)}` : ''}`;
+      if (status.username) document.getElementById('androidUsername').value = status.username;
+    }
+  };
+  F.submitAccount = async function (register) {
+    const server = '', username = document.getElementById('androidUsername').value.trim(), passwordField = document.getElementById('androidPassword'), password = passwordField.value;
+    if (!username || password.length < 8) return A.toast('请填写用户名和至少 8 位密码');
+    const buttons = [document.getElementById('androidLogin'), document.getElementById('androidRegister')]; buttons.forEach(button => button.disabled = true);
+    this.accountSyncProgress({phase:'discovering',done:0,total:1,uploadedItems:0,downloadedItems:0,uploadedBooks:0,downloadedBooks:0});
+    try { const status = await nativeAsync('accountLoginAsync', server, username, password, !!register); passwordField.value = ''; this.applyAccountStatus(status); this.applySyncedState(); const sync=status.sync||{}; A.toast(sync.ok===false ? `账户已连接；${sync.error||'数据将在服务器恢复后同步'}` : '账户已连接，多端数据同步完成'); }
+    catch (error) { A.toast(error.message); this.renderAccountStatus(); }
+    finally { buttons.forEach(button => button.disabled = false); }
+  };
+  F.syncAccountNow = async function () {
+    const button = document.getElementById('androidSyncNow'); button.disabled = true; button.textContent = '正在同步…';
+    this.accountSyncProgress({phase:'preparing',done:0,total:1,uploadedItems:0,downloadedItems:0,uploadedBooks:0,downloadedBooks:0});
+    try { const result = await nativeAsync('syncNowAsync'); this.renderAccountStatus(); this.applySyncedState(); A.toast(result.ok ? `同步完成：上传 ${result.uploaded || 0} 条，接收 ${result.downloaded || 0} 条` : result.error); }
+    catch (error) { A.toast(error.message); this.renderAccountStatus(); }
+    finally { button.disabled = false; button.textContent = '立即同步'; }
+  };
+  F.accountSyncFinished = function (payload) { const result = typeof payload === 'string' ? parse(payload,{}) : payload; this.renderAccountStatus(); if (result?.ok) this.applySyncedState(); };
+  F.accountSyncProgress = function (payload) {
+    const data=typeof payload==='string'?parse(payload,{}):payload||{}, box=document.getElementById('androidSyncProgress'); if(!box)return;
+    const labels={discovering:'正在寻找电脑服务器',reconnecting:'连接变化，正在重新发现服务器',preparing:'正在整理本机数据',exchanging:'正在同步阅读信息',uploadingBooks:'正在上传书籍原文',downloadingBooks:'正在下载书籍原文',complete:'同步完成'};
+    const total=Math.max(1,Number(data.total)||1),done=Math.max(0,Number(data.done)||0),percent=data.phase==='complete'?100:Math.min(96,Math.round(done/total*100));
+    box.classList.remove('hidden'); document.getElementById('androidSyncPhase').textContent=labels[data.phase]||'正在同步'; document.getElementById('androidSyncPercent').textContent=percent+'%'; document.getElementById('androidSyncProgressBar').style.width=percent+'%';
+    document.getElementById('androidSyncCounts').textContent=`上传 ${data.uploadedBooks||0} 本书 / ${data.uploadedItems||0} 条信息 · 下载 ${data.downloadedBooks||0} 本书 / ${data.downloadedItems||0} 条信息`;
+    if(data.phase==='complete')setTimeout(()=>box.classList.add('hidden'),3500);
+  };
+  F.applySyncedState = function () {
+    const theme = Yuejian.getState('yuejian-theme', '');
+    if (theme && ['starry','cat','paper','green','white','night','blue','parchment'].includes(theme)) A.setTheme(theme);
+    this.loadSettings(); this.applyProfile(); this.renderLibrary();
+    if (!document.getElementById('reportPage')?.classList.contains('hidden')) this.renderReport(this.reportScale || 'day');
   };
 
   F.installReadingExperience = function () {
@@ -93,7 +195,7 @@
     const reading = document.getElementById('reading'), scroll = document.getElementById('readingScroll');
     reading.classList.remove('page-layout'); reading.style.width = ''; reading.style.columnWidth = ''; reading.style.columnGap = ''; scroll.onscroll = null; scroll.scrollLeft = 0;
     this.pageResizeObserver?.disconnect(); this.pageResizeObserver = null;
-    this.pageIndex = 0; this.pageCount = 1; this.continuousLoading = false;
+    this.pageIndex = 0; this.pageCount = 1; this.continuousLoading = false; this.prependLoading = false;
   };
   F.afterChapterLoad = function () {
     this.resetReadingLayout();
@@ -112,12 +214,12 @@
   F.setupContinuousMode = function () {
     const host = document.getElementById('reading'), scroll = document.getElementById('readingScroll');
     const nodes = [...host.childNodes]; host.replaceChildren(this.createChapterSection(A.chapter, null, nodes));
-    this.loadedThrough = A.chapter;
+    this.loadedFrom = A.chapter; this.loadedThrough = A.chapter;
     scroll.onscroll = () => {
       clearTimeout(this.continuousScrollTimer);
       this.continuousScrollTimer = setTimeout(() => this.onContinuousScroll(), 35);
     };
-    this.appendNextChapter();
+    this.prependPreviousChapter(); this.appendNextChapter();
   };
   F.appendNextChapter = function () {
     if (this.continuousLoading || !A.book || this.loadedThrough >= A.book.chapters.length - 1) return;
@@ -129,8 +231,24 @@
       } finally { this.continuousLoading = false; }
     }, 0));
   };
+  F.prependPreviousChapter = function () {
+    if (this.prependLoading || !A.book || this.loadedFrom <= 0) return;
+    this.prependLoading = true;
+    requestAnimationFrame(() => setTimeout(async () => {
+      const scroll = document.getElementById('readingScroll'), oldHeight = scroll.scrollHeight;
+      try {
+        const previous = this.loadedFrom - 1, data = await nativeAsync('readChapterAsync', A.book.id, previous);
+        if (!data.error) {
+          document.getElementById('reading').prepend(this.createChapterSection(previous, data));
+          this.loadedFrom = previous;
+          scroll.scrollTop += scroll.scrollHeight - oldHeight;
+        }
+      } finally { this.prependLoading = false; }
+    }, 0));
+  };
   F.onContinuousScroll = function () {
     const scroll = document.getElementById('readingScroll');
+    if (scroll.scrollTop < Math.max(500, scroll.clientHeight * .7)) this.prependPreviousChapter();
     if (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < Math.max(700, scroll.clientHeight)) this.appendNextChapter();
     const sections = [...document.querySelectorAll('.continuous-chapter')];
     let active = sections[0];
@@ -140,6 +258,8 @@
       A.chapter = index;
       document.getElementById('readerChapterTitle').textContent = A.book.chapters[index].title;
       document.getElementById('chapterPage').textContent = `${index + 1} / ${A.book.chapters.length}`;
+      document.getElementById('prevBtn').disabled = index === 0;
+      document.getElementById('nextBtn').disabled = index === A.book.chapters.length - 1;
       A.updateToc(); this.refreshBookmark(); this.updateCompleted();
     }
     A.saveProgress();
@@ -165,12 +285,18 @@
     scroll.ontouchstart = event => { const t = event.touches[0]; startX = t.clientX; startY = t.clientY; };
     scroll.ontouchend = event => { const t = event.changedTouches[0], dx = t.clientX - startX, dy = t.clientY - startY; if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy)) this.turnPage(dx < 0 ? 1 : -1); };
   };
-  F.turnPage = function (direction) {
+  F.turnPage = async function (direction) {
     if (direction > 0 && this.pageIndex < this.pageCount - 1) this.pageIndex++;
     else if (direction < 0 && this.pageIndex > 0) this.pageIndex--;
     else {
       const chapter = A.chapter + direction;
-      if (chapter >= 0 && chapter < A.book.chapters.length) { A.loadChapter(chapter); if (direction < 0) requestAnimationFrame(() => { this.pageIndex = this.pageCount - 1; this.updatePage(); }); }
+      if (chapter >= 0 && chapter < A.book.chapters.length) {
+        await A.loadChapter(chapter);
+        if (direction < 0) {
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          this.pageIndex = Math.max(0, this.pageCount - 1); this.updatePage(false);
+        }
+      }
       return;
     }
     this.updatePage(); A.saveProgress();
@@ -181,10 +307,14 @@
   };
 
   F.installAnnotationUi = function () {
-    document.getElementById('selectionTools').innerHTML = '<button data-action="note">批注</button><button class="color amber" data-action="amber" aria-label="黄色高亮"></button><button class="color red" data-action="red" aria-label="红色高亮"></button><button class="color blue" data-action="blue" aria-label="蓝色高亮"></button><button class="color green" data-action="green" aria-label="绿色高亮"></button><button data-action="ai">AI</button><button data-action="cancel">×</button>';
+    document.getElementById('selectionTools').innerHTML = '<button data-action="copy">复制</button><button data-action="share">分享书签</button><button data-action="paragraph">段落全选</button><button data-action="translate">翻译</button><span class="tool-divider"></span><button data-action="note">批注</button><button class="color amber" data-action="amber" aria-label="黄色高亮"></button><button class="color red" data-action="red" aria-label="红色高亮"></button><button class="color blue" data-action="blue" aria-label="蓝色高亮"></button><button class="color green" data-action="green" aria-label="绿色高亮"></button><button data-action="ai">AI 解析</button><button data-action="cancel" aria-label="关闭">×</button>';
     document.getElementById('selectionTools').onclick = event => {
       const action = event.target.dataset.action; if (!action) return;
       if (['amber','red','blue','green'].includes(action)) this.saveSelection(action, '');
+      if (action === 'copy') this.copySelection();
+      if (action === 'share') this.shareSelection();
+      if (action === 'paragraph') this.selectWholeParagraph();
+      if (action === 'translate') this.translateSelection();
       if (action === 'note') this.openAnnotationEditor(null, this.selectionInfo);
       if (action === 'ai') this.explainSelection();
       if (action === 'cancel') { getSelection().removeAllRanges(); this.hideSelection(); }
@@ -209,6 +339,38 @@
     const left = Math.max(12, Math.min(innerWidth - tools.offsetWidth - 12, rect.left + rect.width / 2 - tools.offsetWidth / 2));
     const top = rect.top > 100 ? rect.top - tools.offsetHeight - 10 : rect.bottom + 10;
     tools.style.left = left + 'px'; tools.style.top = Math.max(8, top) + 'px'; tools.style.bottom = 'auto'; tools.style.transform = 'none';
+  };
+  F.currentSelectionText = function () { return this.selectionInfo?.quote || this.selection || String(getSelection()).trim(); };
+  F.copySelection = function () {
+    const text = this.currentSelectionText(); if (!text) return;
+    if (Yuejian.copyText) Yuejian.copyText(text); else navigator.clipboard?.writeText(text);
+  };
+  F.shareBookmarkText = function () {
+    const quote = this.currentSelectionText(), chapter = this.selectionInfo?.chapter ?? A.chapter,
+      chapterTitle = A.book?.chapters?.[chapter]?.title || `第 ${chapter + 1} 章`,
+      stamp = new Intl.DateTimeFormat('zh-CN',{dateStyle:'medium',timeStyle:'short'}).format(new Date());
+    return `《${A.book?.title || '未命名书籍'}》\n${chapterTitle}\n\n“${quote}”\n\n摘录于 阅见 · ${stamp}`;
+  };
+  F.shareSelection = function () {
+    const quote = this.currentSelectionText(); if (!quote) return;
+    const chapter = this.selectionInfo?.chapter ?? A.chapter, item = {id:'share-'+Date.now().toString(36),bookId:A.book.id,bookTitle:A.book.title,chapter,chapterTitle:A.book.chapters[chapter]?.title||'',quote,created:Date.now()};
+    const saved = readState('shareBookmarks',[]); saved.unshift(item); saveState('shareBookmarks',saved.slice(0,300));
+    const text = this.shareBookmarkText();
+    if (Yuejian.shareText) Yuejian.shareText('《'+A.book.title+'》阅读书签', text); else navigator.share?.({title:A.book.title,text});
+  };
+  F.selectWholeParagraph = function () {
+    const selection = getSelection(); if (!selection.rangeCount) return;
+    const node = selection.getRangeAt(0).commonAncestorContainer, element = node.nodeType===3 ? node.parentElement : node,
+      block = element?.closest?.('p,li,blockquote,h1,h2,h3,h4,h5,h6,figcaption,td,th');
+    if (!block || !document.getElementById('reading').contains(block)) return A.toast('当前位置没有可全选的段落');
+    const range = document.createRange(); range.selectNodeContents(block); selection.removeAllRanges(); selection.addRange(range); this.selectionChanged();
+  };
+  F.translateSelection = async function () {
+    const quote = this.currentSelectionText(); if (!quote) return;
+    this.hideSelection(); this.showReaderMode('qa');
+    document.getElementById('qaList').insertAdjacentHTML('beforeend',`<div class="qa-msg user">翻译选段：${esc(quote.slice(0,300))}</div><div class="qa-msg ai pending">翻译中…</div>`);
+    const target=document.getElementById('qaList').lastElementChild;
+    try { target.textContent=await nativeAsync('translateSelection',A.book.id,quote); } catch(error) { target.textContent=error.message; }
   };
   F.selectionLocator = function (root, range, quote) {
     const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode:node=>node.parentElement.closest('.chapter-divider,.annotation-note,.reader-mark')?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT});
@@ -305,7 +467,13 @@
   ]};
   F.quotes = function(){let list=readState('quotes',null);if(!readState('quotesAlignedV3',false)){const ids=new Set(this.defaultQuotes().map(x=>x.id)),custom=Array.isArray(list)?list.filter(x=>!ids.has(x.id)&&!String(x.id||'').startsWith('builtin-')):[];list=[...this.defaultQuotes(),...custom];saveState('quotes',list);saveState('quotesAlignedV3',true)}return Array.isArray(list)&&list.length?list:this.defaultQuotes()};
   F.renderQuote = function(){const list=this.quotes(),last=readState('quoteLast',{}),pool=list.filter(x=>x.id!==last.last),pick=list.find(x=>x.id===last.pinned)||pool[Math.floor(Math.random()*Math.max(1,pool.length))]||list[0];if(!pick)return;document.querySelector('.hero h2').textContent=pick.original||pick.text;document.querySelector('.hero p').textContent=(pick.translation?pick.translation+' · ':'—— ')+pick.author;saveState('quoteLast',{...last,last:pick.id})};
-  F.renderQuotes = function(){const prefs=readState('quoteLast',{});document.getElementById('quoteList').innerHTML=this.quotes().map(q=>`<div class="quote-row"><blockquote>${esc(q.original||q.text)}${q.translation?`<em>${esc(q.translation)}</em>`:''}</blockquote><small>${esc(q.author)}</small><div class="row"><button class="small-action" onclick="features.pinQuote('${q.id}')">${prefs.pinned===q.id?'已固定':'固定首页'}</button><button class="small-action" onclick="features.deleteQuote('${q.id}')">删除</button></div></div>`).join('')};
+  F.renderQuotes = function(){
+    const prefs=readState('quoteLast',{}),all=this.quotes(),size=5,pages=Math.max(1,Math.ceil(all.length/size));
+    this.quotePage=Math.max(0,Math.min(Number(this.quotePage)||0,pages-1));
+    const rows=all.slice(this.quotePage*size,(this.quotePage+1)*size).map(q=>`<div class="quote-row"><blockquote>${esc(q.original||q.text)}${q.translation?`<em>${esc(q.translation)}</em>`:''}</blockquote><small>${esc(q.author)}</small><div class="row"><button class="small-action" onclick="features.pinQuote('${q.id}')">${prefs.pinned===q.id?'已固定':'固定首页'}</button><button class="small-action" onclick="features.deleteQuote('${q.id}')">删除</button></div></div>`).join('');
+    document.getElementById('quoteList').innerHTML=`<div class="quote-page-list">${rows}</div><div class="quote-pagination"><button class="small-action" ${this.quotePage===0?'disabled':''} onclick="features.changeQuotePage(-1)">上一页</button><span>第 ${this.quotePage+1} / ${pages} 页 · 共 ${all.length} 条</span><button class="small-action" ${this.quotePage>=pages-1?'disabled':''} onclick="features.changeQuotePage(1)">下一页</button></div>`;
+  };
+  F.changeQuotePage=function(step){this.quotePage=(Number(this.quotePage)||0)+step;this.renderQuotes();document.getElementById('quoteList')?.scrollIntoView({behavior:'smooth',block:'start'});};
 
-  A.showAbout = () => A.toast('阅见 Android 1.0.4 · 连续阅读与精确批注版');
+  A.showAbout = () => A.toast('阅见 Android 1.2.3 · AI 报告跨端同步');
 })();

@@ -35,6 +35,7 @@ def self_test():
     port = httpd.server_address[1]
     thread = threading.Thread(target=run_http, args=(httpd,), daemon=True)
     thread.start()
+    threading.Thread(target=server.SYNC_MANAGER.run_sync_once, daemon=True).start()
     try:
         with urllib.request.urlopen(f"http://{HOST}:{port}/api/health?token={httpd.access_token}", timeout=5) as response:
             return 0 if response.status == 200 and server.VERSION.encode("ascii") in response.read() else 1

@@ -57,7 +57,7 @@ final class BookRepository extends SQLiteOpenHelper {
     }
 
     BookRepository(Context context) {
-        super(context, "yuejian.db", null, 5);
+        super(context, "yuejian.db", null, 6);
         this.context = context.getApplicationContext();
         this.booksDir = new File(context.getFilesDir(), "books");
         this.booksDir.mkdirs();
@@ -85,6 +85,16 @@ final class BookRepository extends SQLiteOpenHelper {
             db.execSQL("ALTER TABLE annotations ADD COLUMN prefix TEXT NOT NULL DEFAULT ''");
             db.execSQL("ALTER TABLE annotations ADD COLUMN suffix TEXT NOT NULL DEFAULT ''");
         }
+        if (oldVersion < 6) {
+            createFeatureTables(db);
+            long legacyRows = 0;
+            try (Cursor c = db.rawQuery("SELECT COUNT(*) FROM reading_daily", null)) { if (c.moveToFirst()) legacyRows = c.getLong(0); }
+            if (legacyRows > 0) {
+                String source = localSourceId(db);
+                db.execSQL("INSERT OR IGNORE INTO reading_contributions(day,book_id,source_id,seconds,chars,completed,updated,deleted) SELECT day,book_id,?,seconds,chars,completed,?,0 FROM reading_daily", new Object[]{source, System.currentTimeMillis()});
+                db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES('sync.reading_legacy_migrated','1',?)", new Object[]{System.currentTimeMillis()});
+            }
+        }
     }
 
     private static void createFeatureTables(SQLiteDatabase db) {
@@ -93,6 +103,7 @@ final class BookRepository extends SQLiteOpenHelper {
         db.execSQL("CREATE TABLE IF NOT EXISTS analysis_cache(book_id TEXT PRIMARY KEY,json TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,updated INTEGER NOT NULL,revision INTEGER NOT NULL DEFAULT 0)");
         db.execSQL("CREATE TABLE IF NOT EXISTS analysis_chunks(cache_key TEXT PRIMARY KEY,book_id TEXT NOT NULL,note TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,updated INTEGER NOT NULL)");
         db.execSQL("CREATE TABLE IF NOT EXISTS reading_daily(day TEXT NOT NULL,book_id TEXT NOT NULL,seconds INTEGER NOT NULL DEFAULT 0,chars INTEGER NOT NULL DEFAULT 0,completed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(day,book_id))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS reading_contributions(day TEXT NOT NULL,book_id TEXT NOT NULL,source_id TEXT NOT NULL,seconds INTEGER NOT NULL DEFAULT 0,chars INTEGER NOT NULL DEFAULT 0,completed INTEGER NOT NULL DEFAULT 0,updated INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(day,book_id,source_id))");
         db.execSQL("CREATE TABLE IF NOT EXISTS app_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated INTEGER NOT NULL)");
         db.execSQL("CREATE TABLE IF NOT EXISTS sync_outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,change_id TEXT UNIQUE NOT NULL,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,operation TEXT NOT NULL,payload TEXT NOT NULL,created INTEGER NOT NULL)");
     }
@@ -301,6 +312,7 @@ final class BookRepository extends SQLiteOpenHelper {
         try (Cursor c = getReadableDatabase().rawQuery("SELECT idx,title,path FROM chapters WHERE book_id=? ORDER BY idx", new String[]{id})) {
             while (c.moveToNext()) chapters.put(new JSONObject().put("index", c.getInt(0)).put("title", c.getString(1)).put("path", c.getString(2)));
         }
+        if (chapters.length() == 0) throw new IllegalStateException("书籍原文尚未同步，请在电脑服务器开启后点击立即同步");
         book.put("chapters", chapters);
         getWritableDatabase().execSQL("UPDATE books SET last_opened=? WHERE id=?", new Object[]{System.currentTimeMillis(), id});
         return book;
@@ -490,8 +502,33 @@ final class BookRepository extends SQLiteOpenHelper {
         if (seconds <= 0 && chars <= 0 && completed <= 0) return;
         String day = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(new Date());
         SQLiteDatabase db = getWritableDatabase();
-        db.execSQL("INSERT OR IGNORE INTO reading_daily(day,book_id,seconds,chars,completed) VALUES(?,?,0,0,0)", new Object[]{day, bookId});
-        db.execSQL("UPDATE reading_daily SET seconds=seconds+?,chars=chars+?,completed=MAX(completed,?) WHERE day=? AND book_id=?", new Object[]{Math.min(seconds, 3600), Math.max(0, chars), Math.max(0, completed), day, bookId});
+        String source = localSourceId(db);
+        long now = System.currentTimeMillis();
+        db.execSQL("INSERT OR IGNORE INTO reading_contributions(day,book_id,source_id,seconds,chars,completed,updated,deleted) VALUES(?,?,?,0,0,0,?,0)", new Object[]{day, bookId, source, now});
+        db.execSQL("UPDATE reading_contributions SET seconds=seconds+?,chars=chars+?,completed=MAX(completed,?),updated=?,deleted=0 WHERE day=? AND book_id=? AND source_id=?", new Object[]{Math.min(seconds, 3600), Math.max(0, chars), Math.max(0, completed), now, day, bookId, source});
+        refreshReadingAggregate(db, day, bookId);
+        try (Cursor c = db.rawQuery("SELECT seconds,chars,completed FROM reading_contributions WHERE day=? AND book_id=? AND source_id=?", new String[]{day, bookId, source})) {
+            if (c.moveToFirst()) {
+                JSONObject payload = new JSONObject().put("day", day).put("bookId", bookId).put("seconds", c.getLong(0))
+                        .put("chars", c.getLong(1)).put("completed", c.getInt(2)).put("sourceId", source).put("updatedAt", now);
+                String entityId = day + "::" + bookId + "::" + source;
+                db.delete("sync_outbox", "entity_type='reading_daily' AND entity_id=?", new String[]{entityId});
+                recordChange(db, "reading_daily", entityId, "upsert", payload.toString(), now);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private static String localSourceId(SQLiteDatabase db) {
+        try (Cursor c = db.rawQuery("SELECT value FROM app_state WHERE key='sync.local_source_id'", null)) {
+            if (c.moveToFirst() && !c.getString(0).isEmpty()) return c.getString(0);
+        }
+        String value = "android-" + UUID.randomUUID();
+        db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES('sync.local_source_id',?,?)", new Object[]{value, System.currentTimeMillis()});
+        return value;
+    }
+
+    private static void refreshReadingAggregate(SQLiteDatabase db, String day, String bookId) {
+        db.execSQL("INSERT INTO reading_daily(day,book_id,seconds,chars,completed) SELECT ?,?,COALESCE(SUM(seconds),0),COALESCE(SUM(chars),0),COALESCE(MAX(completed),0) FROM reading_contributions WHERE day=? AND book_id=? AND deleted=0 ON CONFLICT(day,book_id) DO UPDATE SET seconds=excluded.seconds,chars=excluded.chars,completed=excluded.completed", new Object[]{day, bookId, day, bookId});
     }
 
     synchronized JSONArray readingStats() throws Exception {
@@ -536,6 +573,221 @@ final class BookRepository extends SQLiteOpenHelper {
         return getWritableDatabase().delete("sync_outbox", "seq<=?", new String[]{String.valueOf(cursor)});
     }
 
+    synchronized int pendingSyncCount() {
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM sync_outbox", null)) { return c.moveToFirst() ? c.getInt(0) : 0; }
+    }
+
+    synchronized int pendingBlobCount() {
+        int count = 0;
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT id,type FROM books WHERE deleted=0", null)) {
+            while (c.moveToNext()) {
+                File original = new File(new File(booksDir, c.getString(0)), "epub".equals(c.getString(1)) ? "original.epub" : "original.txt");
+                if (!original.isFile()) count++;
+            }
+        }
+        return count;
+    }
+
+    synchronized JSONObject queueFullSyncSnapshot() throws Exception {
+        SQLiteDatabase db = getWritableDatabase(); long now = System.currentTimeMillis();
+        int books = 0, annotations = 0, bookmarks = 0, readingDays = 0, analyses = 0, settings = 0;
+        try (Cursor c = db.rawQuery("SELECT id,title,type,author,original_name,file_size,chapter_count,current_chapter,progress,updated FROM books WHERE deleted=0", null)) {
+            while (c.moveToNext()) {
+                String id = c.getString(0); long updated = Math.max(now, c.getLong(9));
+                JSONObject book = new JSONObject().put("id", id).put("bookId", id).put("title", c.getString(1)).put("type", c.getString(2))
+                        .put("author", c.getString(3)).put("originalName", c.getString(4)).put("fileSize", c.getLong(5))
+                        .put("chapterCount", c.getInt(6)).put("blobSha256", id).put("updatedAt", updated);
+                recordChange(db, "book", id, "upsert", book.toString(), updated);
+                JSONObject progress = new JSONObject().put("bookId", id).put("chapter", c.getInt(7)).put("progress", c.getDouble(8)).put("updatedAt", updated);
+                recordChange(db, "progress", id, "upsert", progress.toString(), updated); books++;
+            }
+        }
+        try (Cursor c = db.rawQuery("SELECT id,book_id,chapter,quote,note,color,created,updated,start_offset,end_offset,prefix,suffix FROM annotations WHERE deleted=0", null)) {
+            while (c.moveToNext()) {
+                JSONObject item = new JSONObject().put("bookId", c.getString(1)).put("chapter", c.getInt(2)).put("quote", c.getString(3)).put("note", c.getString(4))
+                        .put("color", c.getString(5)).put("created", c.getLong(6)).put("updatedAt", c.getLong(7)).put("start", c.getInt(8)).put("end", c.getInt(9)).put("prefix", c.getString(10)).put("suffix", c.getString(11));
+                recordChange(db, "annotation", c.getString(0), "upsert", item.toString(), Math.max(now, c.getLong(7))); annotations++;
+            }
+        }
+        try (Cursor c = db.rawQuery("SELECT id,book_id,chapter,position,label,created,updated FROM bookmarks WHERE deleted=0", null)) {
+            while (c.moveToNext()) {
+                JSONObject item = new JSONObject().put("bookId", c.getString(1)).put("chapter", c.getInt(2)).put("position", c.getDouble(3)).put("label", c.getString(4)).put("created", c.getLong(5)).put("updatedAt", c.getLong(6));
+                recordChange(db, "bookmark", c.getString(0), "upsert", item.toString(), Math.max(now, c.getLong(6))); bookmarks++;
+            }
+        }
+        try (Cursor c = db.rawQuery("SELECT day,book_id,source_id,seconds,chars,completed,updated,deleted FROM reading_contributions", null)) {
+            while (c.moveToNext()) {
+                JSONObject item = new JSONObject().put("day", c.getString(0)).put("bookId", c.getString(1)).put("sourceId", c.getString(2)).put("seconds", c.getLong(3)).put("chars", c.getLong(4)).put("completed", c.getInt(5)).put("updatedAt", c.getLong(6));
+                recordChange(db, "reading_daily", c.getString(0) + "::" + c.getString(1) + "::" + c.getString(2), c.getInt(7) == 1 ? "delete" : "upsert", item.toString(), Math.max(now, c.getLong(6))); readingDays++;
+            }
+        }
+        try (Cursor c = db.rawQuery("SELECT book_id,json,provider,model,updated,revision FROM analysis_cache", null)) {
+            while (c.moveToNext()) {
+                JSONObject item = new JSONObject().put("bookId", c.getString(0)).put("analysis", new JSONObject(c.getString(1))).put("provider", c.getString(2)).put("model", c.getString(3)).put("updatedAt", c.getLong(4)).put("revision", c.getInt(5));
+                recordChange(db, "analysis", c.getString(0), "upsert", item.toString(), c.getLong(4)); analyses++;
+            }
+        }
+        try (Cursor c = db.rawQuery("SELECT key,value,updated FROM app_state WHERE key NOT LIKE 'epub_parser.%'", null)) {
+            while (c.moveToNext()) {
+                String key = c.getString(0), lowered = key.toLowerCase(Locale.ROOT);
+                if (lowered.contains("token") || lowered.contains("cookie") || lowered.contains("api_key") || lowered.contains("protected_key")) continue;
+                JSONObject item = new JSONObject().put("key", key).put("value", c.getString(1)).put("updatedAt", Math.max(now, c.getLong(2)));
+                recordChange(db, "app_state", key, "upsert", item.toString(), Math.max(now, c.getLong(2))); settings++;
+            }
+        }
+        return new JSONObject().put("books", books).put("annotations", annotations).put("bookmarks", bookmarks).put("readingDays", readingDays).put("analyses", analyses).put("settings", settings);
+    }
+
+    synchronized JSONArray syncableBookBlobs() throws Exception {
+        JSONArray result = new JSONArray();
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT id,type,original_name FROM books WHERE deleted=0", null)) {
+            while (c.moveToNext()) {
+                String id = c.getString(0), type = c.getString(1);
+                File original = new File(new File(booksDir, id), "epub".equals(type) ? "original.epub" : "original.txt");
+                if (original.isFile() && original.length() <= 30L * 1024 * 1024) {
+                    result.put(new JSONObject().put("id", id).put("type", type).put("originalName", c.getString(2))
+                            .put("path", original.getAbsolutePath()).put("size", original.length()));
+                }
+            }
+        }
+        return result;
+    }
+
+    synchronized JSONArray missingBookBlobs() throws Exception {
+        JSONArray result = new JSONArray();
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT id,type,original_name FROM books WHERE deleted=0", null)) {
+            while (c.moveToNext()) {
+                String id = c.getString(0), type = c.getString(1);
+                File original = new File(new File(booksDir, id), "epub".equals(type) ? "original.epub" : "original.txt");
+                if (!original.isFile()) result.put(new JSONObject().put("id", id).put("type", type).put("originalName", c.getString(2)));
+            }
+        }
+        return result;
+    }
+
+    synchronized JSONObject importSyncedBlob(File temporary, JSONObject metadata) throws Exception {
+        String id = metadata.optString("id"), type = metadata.optString("type", "epub");
+        requireBookId(id);
+        String originalName = metadata.optString("originalName");
+        if (originalName.isEmpty()) originalName = metadata.optString("title", "同步书籍") + ("txt".equals(type) ? ".txt" : ".epub");
+        if (!(originalName.toLowerCase(Locale.ROOT).endsWith(".epub") || originalName.toLowerCase(Locale.ROOT).endsWith(".txt")))
+            originalName += "txt".equals(type) ? ".txt" : ".epub";
+        JSONObject imported = importDownloaded(temporary, originalName);
+        if (!id.equals(imported.optString("id"))) throw new IllegalStateException("同步书籍哈希校验失败");
+        return imported;
+    }
+
+    File createSyncTemporary() throws Exception { return File.createTempFile("sync-book-", ".part", context.getCacheDir()); }
+
+    synchronized void applyRemoteChange(JSONObject change) throws Exception {
+        String type = change.optString("entityType"), id = change.optString("entityId"), operation = change.optString("operation");
+        JSONObject payload = change.optJSONObject("payload"); if (payload == null) payload = new JSONObject();
+        long updated = Math.max(0, payload.optLong("updatedAt", payload.optLong("updated", change.optLong("createdAt", 0))));
+        SQLiteDatabase db = getWritableDatabase();
+        if ("progress".equals(type)) {
+            String bookId = payload.optString("bookId", id);
+            long local = rowLong(db, "SELECT updated FROM books WHERE id=?", bookId);
+            if (updated >= local) db.execSQL("UPDATE books SET current_chapter=?,progress=?,last_opened=?,updated=? WHERE id=?", new Object[]{Math.max(0, payload.optInt("chapter")), Math.max(0, Math.min(1, payload.optDouble("progress"))), updated, updated, bookId});
+            return;
+        }
+        if ("annotation".equals(type) || "reader_mark".equals(type)) {
+            if ("delete".equals(operation)) { db.execSQL("UPDATE annotations SET deleted=1,updated=MAX(updated,?) WHERE id=?", new Object[]{updated, id}); return; }
+            long local = rowLong(db, "SELECT updated FROM annotations WHERE id=?", id); if (updated < local) return;
+            String bookId = payload.optString("bookId", payload.optString("book", "")); if (bookId.isEmpty()) return;
+            db.execSQL("INSERT OR REPLACE INTO annotations(id,book_id,chapter,quote,note,color,created,updated,deleted,start_offset,end_offset,prefix,suffix) VALUES(?,?,?,?,?,?,?,?,0,?,?,?,?)",
+                    new Object[]{id, bookId, Math.max(0, payload.optInt("chapter")), payload.optString("quote"), payload.optString("note"), payload.optString("color", "amber"), payload.optLong("created", updated), updated, payload.optInt("start", -1), payload.optInt("end", -1), payload.optString("prefix"), payload.optString("suffix")});
+            return;
+        }
+        if ("bookmark".equals(type)) {
+            if ("delete".equals(operation)) { db.execSQL("UPDATE bookmarks SET deleted=1,updated=MAX(updated,?) WHERE id=?", new Object[]{updated, id}); return; }
+            long local = rowLong(db, "SELECT updated FROM bookmarks WHERE id=?", id); if (updated < local) return;
+            String bookId = payload.optString("bookId"); if (bookId.isEmpty()) return;
+            db.execSQL("INSERT OR REPLACE INTO bookmarks(id,book_id,chapter,position,label,created,updated,deleted) VALUES(?,?,?,?,?,?,?,0)",
+                    new Object[]{id, bookId, Math.max(0, payload.optInt("chapter")), payload.optDouble("position"), payload.optString("label"), payload.optLong("created", updated), updated});
+            return;
+        }
+        if ("reading_daily".equals(type)) {
+            String day = payload.optString("day"), bookId = payload.optString("bookId"); if (day.isEmpty() || bookId.isEmpty()) return;
+            String source = payload.optString("sourceId");
+            if (source.isEmpty()) {
+                String suffix = id.startsWith(day + "::" + bookId + "::") ? id.substring((day + "::" + bookId + "::").length()) : "legacy-remote";
+                source = suffix.isEmpty() ? "legacy-remote" : suffix;
+            }
+            if (source.startsWith("legacy-") && "1".equals(state("sync.reading_legacy_migrated", "0"))) return;
+            long local = -1;
+            try (Cursor c = db.rawQuery("SELECT updated FROM reading_contributions WHERE day=? AND book_id=? AND source_id=?", new String[]{day, bookId, source})) { if (c.moveToFirst()) local = c.getLong(0); }
+            if (updated < local) return;
+            db.execSQL("INSERT OR REPLACE INTO reading_contributions(day,book_id,source_id,seconds,chars,completed,updated,deleted) VALUES(?,?,?,?,?,?,?,?)",
+                    new Object[]{day, bookId, source, Math.max(0, payload.optLong("seconds")), Math.max(0, payload.optLong("chars")), Math.max(0, payload.optInt("completed")), updated, "delete".equals(operation) ? 1 : 0});
+            refreshReadingAggregate(db, day, bookId);
+            return;
+        }
+        if ("analysis".equals(type)) {
+            if ("delete".equals(operation)) { db.delete("analysis_cache", "book_id=?", new String[]{id}); return; }
+            JSONObject analysis = payload.optJSONObject("analysis"); if (analysis == null) return;
+            long local = rowLong(db, "SELECT updated FROM analysis_cache WHERE book_id=?", id); if (updated < local) return;
+            db.execSQL("INSERT OR REPLACE INTO analysis_cache(book_id,json,provider,model,updated,revision) VALUES(?,?,?,?,?,?)",
+                    new Object[]{payload.optString("bookId", id), analysis.toString(), payload.optString("provider"), payload.optString("model"), updated, payload.optInt("revision")});
+            return;
+        }
+        if ("book".equals(type) || "book_meta".equals(type)) {
+            if ("delete".equals(operation)) {
+                db.execSQL("UPDATE books SET deleted=1,updated=MAX(updated,?) WHERE id=?", new Object[]{updated, id});
+                db.delete("chapters", "book_id=?", new String[]{id});
+                db.delete("analysis_cache", "book_id=?", new String[]{id});
+                db.delete("analysis_chunks", "book_id=?", new String[]{id});
+                db.execSQL("UPDATE annotations SET deleted=1,updated=MAX(updated,?) WHERE book_id=?", new Object[]{updated, id});
+                db.execSQL("UPDATE bookmarks SET deleted=1,updated=MAX(updated,?) WHERE book_id=?", new Object[]{updated, id});
+                deleteTree(new File(booksDir, id));
+                return;
+            }
+            long local = rowLong(db, "SELECT updated FROM books WHERE id=?", id); if (updated < local) return;
+            db.execSQL("INSERT OR IGNORE INTO books(id,title,type,author,cover_path,original_name,file_size,added,last_opened,progress,current_chapter,chapter_count,updated,deleted) VALUES(?,?,?,?,?,?,?, ?,0,0,0,?,?,0)",
+                    new Object[]{id, payload.optString("title", "未下载书籍"), payload.optString("type", "epub"), payload.optString("author"), "", payload.optString("originalName"), payload.optLong("fileSize"), payload.optLong("addedAt", updated), payload.optInt("chapterCount"), updated});
+            db.execSQL("UPDATE books SET title=?,author=?,original_name=?,file_size=?,chapter_count=MAX(chapter_count,?),updated=?,deleted=0 WHERE id=?",
+                    new Object[]{payload.optString("title", "未下载书籍"), payload.optString("author"), payload.optString("originalName"), payload.optLong("fileSize"), payload.optInt("chapterCount"), updated, id});
+            return;
+        }
+        if ("app_state".equals(type)) applyRemoteState(db, payload.optString("key", id), payload.optString("value", ""), operation, updated);
+    }
+
+    private void applyRemoteState(SQLiteDatabase db, String key, String value, String operation, long updated) throws Exception {
+        String lowered = key.toLowerCase(Locale.ROOT);
+        if (key.isEmpty() || lowered.contains("token") || lowered.contains("cookie") || lowered.contains("local-path")
+                || lowered.contains("local_path") || lowered.contains("protected_key") || lowered.contains("api-key") || lowered.contains("api_key")) return;
+        if ("delete".equals(operation)) { db.delete("app_state", "key=?", new String[]{key}); return; }
+        long local = rowLong(db, "SELECT updated FROM app_state WHERE key=?", key); if (updated < local) return;
+        db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES(?,?,?)", new Object[]{key, value, updated});
+        if ("yuejian-profile-name".equals(key) || "yuejian-profile-avatar".equals(key)) {
+            JSONObject profile; try { profile = new JSONObject(state("profile", "{}")); } catch (Exception ignored) { profile = new JSONObject(); }
+            if ("yuejian-profile-name".equals(key)) profile.put("name", value); else profile.put("avatar", value);
+            db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES('profile',?,?)", new Object[]{profile.toString(), updated});
+        }
+        if ("yuejian-reader-marks".equals(key)) {
+            JSONArray marks; try { marks = new JSONArray(value); } catch (Exception ignored) { return; }
+            for (int index = 0; index < marks.length(); index++) {
+                JSONObject mark = marks.optJSONObject(index); if (mark == null) continue;
+                JSONObject remote = new JSONObject().put("entityType", "reader_mark").put("entityId", mark.optString("id", UUID.randomUUID().toString()))
+                        .put("operation", "upsert").put("payload", mark.put("updatedAt", mark.optLong("updated", updated)));
+                applyRemoteChange(remote);
+            }
+        }
+        if ("yuejian-book-progress".equals(key)) {
+            JSONObject progress; try { progress = new JSONObject(value); } catch (Exception ignored) { return; }
+            java.util.Iterator<String> ids = progress.keys();
+            while (ids.hasNext()) {
+                String bookId = ids.next(); JSONObject item = progress.optJSONObject(bookId); if (item == null) continue;
+                JSONObject remote = new JSONObject().put("entityType", "progress").put("entityId", bookId).put("operation", "upsert")
+                        .put("payload", item.put("bookId", bookId));
+                applyRemoteChange(remote);
+            }
+        }
+    }
+
+    private static long rowLong(SQLiteDatabase db, String sql, String value) {
+        try (Cursor c = db.rawQuery(sql, new String[]{value})) { return c.moveToFirst() ? c.getLong(0) : -1; }
+    }
+
     synchronized JSONObject storageStatus() throws Exception {
         long books = directorySize(booksDir), database = context.getDatabasePath("yuejian.db").length();
         int bookCount = 0, analysisCount = 0, annotationCount = 0;
@@ -547,8 +799,17 @@ final class BookRepository extends SQLiteOpenHelper {
 
     synchronized int clearAnalysis(String bookId) {
         SQLiteDatabase db = getWritableDatabase();
-        if (bookId == null || bookId.isEmpty()) { int count = db.delete("analysis_cache", null, null); db.delete("analysis_chunks", null, null); return count; }
-        requireBookId(bookId); int count = db.delete("analysis_cache", "book_id=?", new String[]{bookId}); db.delete("analysis_chunks", "book_id=?", new String[]{bookId}); return count;
+        long now = System.currentTimeMillis();
+        if (bookId == null || bookId.isEmpty()) {
+            int count = 0;
+            try (Cursor c = db.rawQuery("SELECT book_id FROM analysis_cache", null)) {
+                while (c.moveToNext()) { recordChange(db, "analysis", c.getString(0), "delete", "{\"updatedAt\":" + now + "}", now); count++; }
+            }
+            db.delete("analysis_cache", null, null); db.delete("analysis_chunks", null, null); return count;
+        }
+        requireBookId(bookId); int count = db.delete("analysis_cache", "book_id=?", new String[]{bookId}); db.delete("analysis_chunks", "book_id=?", new String[]{bookId});
+        if (count > 0) recordChange(db, "analysis", bookId, "delete", "{\"bookId\":\"" + bookId + "\",\"updatedAt\":" + now + "}", now);
+        return count;
     }
 
     private static void recordChange(SQLiteDatabase db, String entityType, String entityId, String operation, String payload, long created) {
@@ -565,12 +826,31 @@ final class BookRepository extends SQLiteOpenHelper {
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
         try {
+            long now = System.currentTimeMillis();
+            try (Cursor c = db.rawQuery("SELECT id FROM annotations WHERE book_id=? AND deleted=0", new String[]{id})) {
+                while (c.moveToNext()) recordChange(db, "annotation", c.getString(0), "delete", new JSONObject().put("bookId", id).put("updatedAt", now).toString(), now);
+            } catch (Exception ignored) {}
+            try (Cursor c = db.rawQuery("SELECT id FROM bookmarks WHERE book_id=? AND deleted=0", new String[]{id})) {
+                while (c.moveToNext()) recordChange(db, "bookmark", c.getString(0), "delete", new JSONObject().put("bookId", id).put("updatedAt", now).toString(), now);
+            } catch (Exception ignored) {}
+            try (Cursor c = db.rawQuery("SELECT day,source_id,seconds,chars,completed FROM reading_contributions WHERE book_id=? AND deleted=0", new String[]{id})) {
+                while (c.moveToNext()) {
+                    String entityId = c.getString(0) + "::" + id + "::" + c.getString(1);
+                    JSONObject payload = new JSONObject().put("day", c.getString(0)).put("bookId", id).put("sourceId", c.getString(1)).put("seconds", c.getLong(2)).put("chars", c.getLong(3)).put("completed", c.getInt(4)).put("updatedAt", now);
+                    recordChange(db, "reading_daily", entityId, "delete", payload.toString(), now);
+                }
+            } catch (Exception ignored) {}
             db.delete("chapters", "book_id=?", new String[]{id});
             db.delete("analysis_cache", "book_id=?", new String[]{id});
             db.delete("analysis_chunks", "book_id=?", new String[]{id});
-            long now = System.currentTimeMillis();
+            try { recordChange(db, "analysis", id, "delete", new JSONObject().put("bookId", id).put("updatedAt", now).toString(), now); } catch (Exception ignored) {}
+            db.execSQL("UPDATE annotations SET deleted=1,updated=? WHERE book_id=?", new Object[]{now, id});
+            db.execSQL("UPDATE bookmarks SET deleted=1,updated=? WHERE book_id=?", new Object[]{now, id});
+            db.execSQL("UPDATE reading_contributions SET deleted=1,updated=? WHERE book_id=?", new Object[]{now, id});
+            db.delete("reading_daily", "book_id=?", new String[]{id});
             db.execSQL("UPDATE books SET deleted=1,updated=? WHERE id=?", new Object[]{now, id});
-            recordChange(db, "book", id, "delete", "{}", now);
+            try { recordChange(db, "book", id, "delete", new JSONObject().put("bookId", id).put("updatedAt", now).toString(), now); }
+            catch (Exception ignored) { recordChange(db, "book", id, "delete", "{}", now); }
             db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
         deleteTree(new File(booksDir, id));
@@ -584,19 +864,23 @@ final class BookRepository extends SQLiteOpenHelper {
         return readAll(new FileInputStream(resource));
     }
 
-    private static JSONObject bookJson(Cursor c) throws Exception {
+    private JSONObject bookJson(Cursor c) throws Exception {
         String id = c.getString(0), cover = c.getString(4);
+        String type = c.getString(2);
+        File original = new File(new File(booksDir, id), "epub".equals(type) ? "original.epub" : "original.txt");
         return new JSONObject().put("id", id).put("title", c.getString(1)).put("type", c.getString(2))
                 .put("author", c.getString(3)).put("coverUrl", cover.isEmpty() ? "" : "https://app.local/content/" + id + "/" + cover)
                 .put("added", c.getLong(5)).put("lastOpened", c.getLong(6)).put("progress", c.getDouble(7))
-                .put("currentChapter", c.getInt(8)).put("chapterCount", c.getInt(9)).put("originalName", c.getString(10)).put("fileSize", c.getLong(11)).put("analyzed", c.getInt(12) != 0);
+                .put("currentChapter", c.getInt(8)).put("chapterCount", c.getInt(9)).put("originalName", c.getString(10)).put("fileSize", c.getLong(11))
+                .put("available", original.isFile()).put("analyzed", c.getInt(12) != 0);
     }
 
     private static void upsertBook(SQLiteDatabase db, String id, String title, String type, String author, String coverPath, String originalName, long fileSize, int count) {
         long now = System.currentTimeMillis();
         db.execSQL("INSERT OR REPLACE INTO books(id,title,type,author,cover_path,original_name,file_size,added,last_opened,progress,current_chapter,chapter_count,updated,deleted) VALUES(?,?,?,?,?,?,?,?,0,0,0,?,?,0)", new Object[]{id, title, type, author, coverPath, originalName, fileSize, now, count, now});
         try {
-            JSONObject payload = new JSONObject().put("id", id).put("title", title).put("type", type).put("author", author).put("chapterCount", count).put("updatedAt", now);
+            JSONObject payload = new JSONObject().put("id", id).put("bookId", id).put("title", title).put("type", type).put("author", author)
+                    .put("chapterCount", count).put("originalName", originalName).put("fileSize", fileSize).put("blobSha256", id).put("updatedAt", now);
             recordChange(db, "book", id, "upsert", payload.toString(), now);
         } catch (Exception ignored) {}
     }
