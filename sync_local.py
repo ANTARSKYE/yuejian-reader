@@ -25,7 +25,12 @@ SYNC_KEYS = {
     "yuejian-profile-name", "yuejian-profile-avatar", "yuejian-quotes",
     "yuejian-quote-library", "yuejian-share-bookmarks",
 }
+SYNC_KEY_PREFIXES = ("yuejian-qa-topic-",)
 FORBIDDEN_PARTS = ("api-key", "api_key", "token", "local-path", "local_path", "cookie", "log")
+
+
+def _is_sync_key(key):
+    return key in SYNC_KEYS or any(str(key).startswith(prefix) for prefix in SYNC_KEY_PREFIXES)
 
 
 def _now():
@@ -111,7 +116,7 @@ class LocalSyncManager:
         if not isinstance(patch, dict):
             return
         for key, value in patch.items():
-            if key not in SYNC_KEYS:
+            if not _is_sync_key(key):
                 continue
             if key == "yuejian-reading-contributions":
                 self._record_reading_contributions(value)
@@ -237,7 +242,7 @@ class LocalSyncManager:
         return {
             "books": len(library) if isinstance(library, dict) else 0,
             "analyses": len(analyses) if isinstance(analyses, dict) else 0,
-            "settings": sum(1 for key in state if key in SYNC_KEYS) if isinstance(state, dict) else 0,
+            "settings": sum(1 for key in state if _is_sync_key(key)) if isinstance(state, dict) else 0,
         }
 
     def _request(self, path, body=None, token="", method="POST", maximum=2_000_000):
@@ -374,7 +379,7 @@ class LocalSyncManager:
                         if isinstance(profile.get("avatar"), str) and len(profile["avatar"].encode("utf-8")) <= 2 * 1024 * 1024: state["yuejian-profile-avatar"] = profile["avatar"]
                         return state
                     update_json(self.ui_state_file, {}, merge_profile)
-            if key not in SYNC_KEYS:
+            if not _is_sync_key(key):
                 # Android uses shorter app_state names. Preserve them in a namespaced key.
                 key = "yuejian-android-state-" + re_safe_key(key)
             def apply(state):
@@ -479,6 +484,8 @@ class LocalSyncManager:
                     if by_book: remote[book_id] = by_book
                     else: remote.pop(book_id, None)
                     stats = all_stats.get(book_id) if isinstance(all_stats.get(book_id), dict) else {}
+                    stats["completed"] = stats.get("completed") if isinstance(stats.get("completed"), list) else []
+                    stats["sessions"] = max(0, int(stats.get("sessions", 0) or 0))
                     daily, daily_chars = {}, {}
                     sources = []
                     own = local.get(book_id) if isinstance(local.get(book_id), dict) else None

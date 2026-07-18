@@ -17,6 +17,7 @@ final class AiClient {
 
     private static final String CHUNK_PROMPT = "你是中文阅读研究助理。只依据所给书籍分段生成紧凑阅读笔记。按【段落主线】【关键论点】【概念与人物】【证据或例子】【与全书关系】【读者问题】六项输出；不确定处写本段未充分支持，不得虚构。";
     private static final String ANALYSIS_PROMPT = "你是严谨的中文阅读导师。只依据输入笔记生成深度阅读报告，不得虚构。只输出严格 JSON，不要 Markdown。必须含：schema_version=2；one_sentence；book_purpose；domain{primary,secondary,difficulty,book_type,best_for}；executive_summary{overview,distinctive_value,prerequisites,limitations}；outline[{title,summary}]；key_points[{title,detail,chapters}]；core_concepts[{term,explanation,importance,chapters}]；argument_map[{stage,claim,support,connection}]；chapter_connections[{chapters,connection,reading_tip}]；reading_guide{before_reading,reading_path[{stage,chapters,focus,question}],reading_methods}；key_figures[{name,role,importance,chapters}]；misconceptions[{misconception,clarification,why}]；critical_questions[{question,why_it_matters,chapters}]；practical_insights[{insight,how_to_use}]；memory_cards[{question,answer}]；further_directions[{direction,reason}]；caveat。每数组 2-6 项，确保 JSON 完整闭合。";
+    private static final String BALANCE_WARNING = "AI API 余额或可用额度不足，请前往服务商控制台充值或检查计费账户后重试。";
 
     static JSONObject analyze(JSONObject config, BookRepository repository, String bookId, String title, String text, AtomicBoolean cancelled, Progress progress) throws Exception {
         int chunkSize = 36000, count = Math.max(1, (text.length() + chunkSize - 1) / chunkSize);
@@ -77,7 +78,8 @@ final class AiClient {
                 InputStream stream = status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream();
                 String response = new String(readAll(stream), StandardCharsets.UTF_8);
                 if (status < 200 || status >= 300) {
-                    last = new IllegalArgumentException("AI 服务返回 HTTP " + status + "：" + response.substring(0, Math.min(300, response.length())));
+                    last = httpError(status, response);
+                    if (BALANCE_WARNING.equals(last.getMessage())) throw last;
                     if (!(status == 408 || status == 429 || status >= 500)) throw last;
                 } else {
                     JSONObject value = new JSONObject(response);
@@ -88,11 +90,20 @@ final class AiClient {
                     if (text.length() > 0) return text.toString();
                     throw new IllegalArgumentException("AI 服务没有返回文字内容");
                 }
-            } catch (Exception error) { last = error; }
+            } catch (Exception error) { if (BALANCE_WARNING.equals(error.getMessage())) throw error; last = error; }
             finally { if (connection != null) connection.disconnect(); }
             if (attempt < 2) Thread.sleep(800L << attempt);
         }
         throw last == null ? new IllegalArgumentException("AI 请求失败") : last;
+    }
+
+    private static Exception httpError(int status, String response) {
+        String lower = String.valueOf(response).toLowerCase();
+        String[] markers = {"insufficient_quota","insufficient quota","insufficient balance","account balance","billing","payment required","credit balance","recharge","余额不足","额度不足","欠费","充值"};
+        if (status == 402) return new IllegalArgumentException(BALANCE_WARNING);
+        for (String marker : markers) if (lower.contains(marker)) return new IllegalArgumentException(BALANCE_WARNING);
+        if (status == 429) return new IllegalArgumentException("AI API 请求过于频繁或已达到速率限制，请稍后重试。");
+        return new IllegalArgumentException("AI 服务返回 HTTP " + status + "：" + response.substring(0, Math.min(300, response.length())));
     }
 
     private static JSONObject parseObject(String raw) throws Exception {

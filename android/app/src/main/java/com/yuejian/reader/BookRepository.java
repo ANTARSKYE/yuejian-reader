@@ -488,6 +488,15 @@ final class BookRepository extends SQLiteOpenHelper {
         try (Cursor c = getReadableDatabase().rawQuery("SELECT value FROM app_state WHERE key=?", new String[]{key})) { return c.moveToFirst() ? c.getString(0) : fallback; }
     }
 
+    synchronized JSONObject statesWithPrefix(String prefix) throws Exception {
+        JSONObject values = new JSONObject();
+        if (prefix == null || prefix.length() < 3 || prefix.length() > 80) return values;
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT key,value FROM app_state WHERE key GLOB ? ORDER BY updated DESC", new String[]{prefix + "*"})) {
+            while (c.moveToNext()) values.put(c.getString(0), c.getString(1));
+        }
+        return values;
+    }
+
     synchronized void saveState(String key, String value) {
         if (!key.matches("[a-zA-Z0-9_.-]{1,80}") || value.length() > 2_000_000) throw new IllegalArgumentException("设置内容无效");
         long now = System.currentTimeMillis();

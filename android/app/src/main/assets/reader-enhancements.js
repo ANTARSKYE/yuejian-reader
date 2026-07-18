@@ -6,6 +6,11 @@
   if (!Yuejian.accountLoginAsync) Yuejian.accountLoginAsync = (requestId, serverUrl, username) => setTimeout(() => A.nativeResult(JSON.stringify({requestId,ok:true,result:{mode:'account',serverUrl,username,pendingChanges:0,lastSyncAt:Date.now(),lastError:''}})), 30);
   if (!Yuejian.syncNowAsync) Yuejian.syncNowAsync = requestId => setTimeout(() => A.nativeResult(JSON.stringify({requestId,ok:true,result:{mode:'account',ok:true,uploaded:0,downloaded:0,pendingChanges:0}})), 30);
   if (!Yuejian.accountLogoutAsync) Yuejian.accountLogoutAsync = requestId => setTimeout(() => A.nativeResult(JSON.stringify({requestId,ok:true,result:{mode:'local',pendingChanges:0}})), 30);
+  if (!Yuejian.getStates) {
+    const knownStateKeys=new Set(),nativeSetState=Yuejian.setState.bind(Yuejian);
+    Yuejian.setState=(key,value)=>{knownStateKeys.add(String(key));return nativeSetState(key,value)};
+    Yuejian.getStates=prefix=>JSON.stringify(Object.fromEntries([...knownStateKeys].filter(key=>key.startsWith(prefix)).map(key=>[key,Yuejian.getState(key,'')])));
+  }
   const parse = (value, fallback) => { try { return JSON.parse(value); } catch { return fallback; } };
   const esc = value => A.escape(value ?? '');
   const readState = (key, fallback) => parse(Yuejian.getState(key, JSON.stringify(fallback)), fallback);
@@ -35,13 +40,15 @@
   const originalInit = F.init.bind(F);
   F.init = function () {
     originalInit();
-    A.showAbout = () => A.toast('阅见 Android 1.2.3 · AI 报告跨端同步');
+    A.showAbout = () => A.toast('阅见 Android 1.2.8 · 阅读页内翻译');
     this.installReadingExperience();
     this.installAnnotationUi();
     this.installNavigationFeedback();
     this.installAccountSync();
     this.installBackgroundPicker();
     this.installProfilePicker();
+    this.installQaTopics();
+    this.installStorageLocationInfo();
   };
 
   F.installBackgroundPicker = function () {
@@ -61,6 +68,11 @@
     picker.innerHTML='<span class="profile-picker-icon">◉</span><span><b>更换本地头像</b><small id="avatarFileName">选择 JPG、PNG 或 WebP 图片</small></span><em>选择图片</em>';
     input.insertAdjacentElement('afterend',picker); picker.onclick=()=>input.click();
     input.addEventListener('change',()=>{const file=input.files?.[0];if(file)document.getElementById('avatarFileName').textContent=file.name;});
+  };
+
+  F.installStorageLocationInfo = function(){
+    const storage=document.getElementById('storageInfo');if(!storage||document.getElementById('localStorageLocations'))return;
+    storage.insertAdjacentHTML('afterend','<div id="localStorageLocations" class="local-storage-locations"><div><span>导入书籍</span><b>应用内部存储 / 阅见</b><small>由 Android 安全管理，仅本应用与账户同步使用</small></div><div><span>分享书签图片</span><b>系统相册 / Pictures / 阅见</b><small>保存后可直接在相册、微信或其他应用中查看</small></div></div>');
   };
 
   F.installNavigationFeedback = function () {
@@ -163,6 +175,7 @@
     if (theme && ['starry','cat','paper','green','white','night','blue','parchment'].includes(theme)) A.setTheme(theme);
     this.loadSettings(); this.applyProfile(); this.renderLibrary();
     if (!document.getElementById('reportPage')?.classList.contains('hidden')) this.renderReport(this.reportScale || 'day');
+    if (this.mode === 'qa') this.renderQaTopics();
   };
 
   F.installReadingExperience = function () {
@@ -307,7 +320,7 @@
   };
 
   F.installAnnotationUi = function () {
-    document.getElementById('selectionTools').innerHTML = '<button data-action="copy">复制</button><button data-action="share">分享书签</button><button data-action="paragraph">段落全选</button><button data-action="translate">翻译</button><span class="tool-divider"></span><button data-action="note">批注</button><button class="color amber" data-action="amber" aria-label="黄色高亮"></button><button class="color red" data-action="red" aria-label="红色高亮"></button><button class="color blue" data-action="blue" aria-label="蓝色高亮"></button><button class="color green" data-action="green" aria-label="绿色高亮"></button><button data-action="ai">AI 解析</button><button data-action="cancel" aria-label="关闭">×</button>';
+    document.getElementById('selectionTools').innerHTML = '<button data-action="copy">复制</button><button data-action="share">分享书签</button><button data-action="paragraph">段落全选</button><button data-action="translate">快速翻译</button><button data-action="ai-translate">AI 翻译</button><span class="tool-divider"></span><button data-action="note">批注</button><button class="color amber" data-action="amber" aria-label="黄色高亮"></button><button class="color red" data-action="red" aria-label="红色高亮"></button><button class="color blue" data-action="blue" aria-label="蓝色高亮"></button><button class="color green" data-action="green" aria-label="绿色高亮"></button><button data-action="ai">AI 解析</button><button data-action="cancel" aria-label="关闭">×</button>';
     document.getElementById('selectionTools').onclick = event => {
       const action = event.target.dataset.action; if (!action) return;
       if (['amber','red','blue','green'].includes(action)) this.saveSelection(action, '');
@@ -315,6 +328,7 @@
       if (action === 'share') this.shareSelection();
       if (action === 'paragraph') this.selectWholeParagraph();
       if (action === 'translate') this.translateSelection();
+      if (action === 'ai-translate') this.openAiTranslation();
       if (action === 'note') this.openAnnotationEditor(null, this.selectionInfo);
       if (action === 'ai') this.explainSelection();
       if (action === 'cancel') { getSelection().removeAllRanges(); this.hideSelection(); }
@@ -345,18 +359,32 @@
     const text = this.currentSelectionText(); if (!text) return;
     if (Yuejian.copyText) Yuejian.copyText(text); else navigator.clipboard?.writeText(text);
   };
-  F.shareBookmarkText = function () {
-    const quote = this.currentSelectionText(), chapter = this.selectionInfo?.chapter ?? A.chapter,
-      chapterTitle = A.book?.chapters?.[chapter]?.title || `第 ${chapter + 1} 章`,
-      stamp = new Intl.DateTimeFormat('zh-CN',{dateStyle:'medium',timeStyle:'short'}).format(new Date());
-    return `《${A.book?.title || '未命名书籍'}》\n${chapterTitle}\n\n“${quote}”\n\n摘录于 阅见 · ${stamp}`;
+  F.bookmarkPalette = function () {
+    const palettes={starry:{top:'#06142f',bottom:'#173a78',card:'rgba(10,29,67,.86)',ink:'#f4f7ff',muted:'#b8c8ea',accent:'#86b5ff',glow:'#f6d376'},cat:{top:'#f6dfcf',bottom:'#d99c92',card:'rgba(255,248,239,.9)',ink:'#503632',muted:'#87645d',accent:'#b86d70',glow:'#fff3d3'},night:{top:'#11151f',bottom:'#283044',card:'rgba(22,27,39,.92)',ink:'#f1eee8',muted:'#b5b0a8',accent:'#cba47d',glow:'#dbc893'},green:{top:'#e5efe4',bottom:'#8faf91',card:'rgba(247,252,246,.9)',ink:'#29382c',muted:'#657568',accent:'#53755a',glow:'#f6ffe9'},white:{top:'#f8f8f8',bottom:'#bfc4ca',card:'rgba(255,255,255,.92)',ink:'#20242a',muted:'#687079',accent:'#4f647a',glow:'#ffffff'},blue:{top:'#dcecf6',bottom:'#7ca8c8',card:'rgba(246,251,255,.9)',ink:'#253c4d',muted:'#5d7483',accent:'#477c9d',glow:'#eff8ff'},parchment:{top:'#efe1c5',bottom:'#b88e5f',card:'rgba(255,249,235,.9)',ink:'#4c3927',muted:'#78624b',accent:'#9a6c3e',glow:'#fff2c9'},paper:{top:'#f3eee5',bottom:'#c9bba7',card:'rgba(255,253,248,.92)',ink:'#342f2a',muted:'#71685f',accent:'#7b6654',glow:'#fffdf3'}};
+    return palettes[document.body.dataset.theme]||palettes.paper;
+  };
+  F.bookmarkRoundRect = function(ctx,x,y,w,h,r){r=Math.min(r,w/2,h/2);ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()};
+  F.bookmarkLines = function(ctx,text,width,max){const chars=Array.from(String(text||'').replace(/\s+/g,' ').trim()),lines=[];let line='';for(const ch of chars){if(ctx.measureText(line+ch).width<=width||!line)line+=ch;else{lines.push(line);line=ch;if(lines.length===max)break}}if(lines.length<max&&line)lines.push(line);if(lines.join('').length<chars.length&&lines.length){let last=lines.at(-1);while(last&&ctx.measureText(last+'…').width>width)last=last.slice(0,-1);lines[lines.length-1]=last.replace(/[，。；、,.!?！？\s]+$/,'')+'…'}return lines};
+  F.createBookmarkImage = function(item){
+    const canvas=document.createElement('canvas'),ctx=canvas.getContext('2d'),p=this.bookmarkPalette();canvas.width=900;canvas.height=1200;
+    const gradient=ctx.createLinearGradient(0,0,900,1200);gradient.addColorStop(0,p.top);gradient.addColorStop(1,p.bottom);ctx.fillStyle=gradient;ctx.fillRect(0,0,900,1200);
+    ctx.globalAlpha=.24;ctx.strokeStyle=p.glow;ctx.lineWidth=2;for(let i=0;i<6;i++){ctx.beginPath();ctx.arc(770,95,72+i*22,Math.PI*.72,Math.PI*1.76);ctx.stroke()}[[95,110,7],[145,185,4],[790,300,6],[110,1020,5],[805,1090,8]].forEach(([x,y,r])=>{ctx.fillStyle=p.glow;ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill()});
+    ctx.globalAlpha=1;ctx.fillStyle=p.card;this.bookmarkRoundRect(ctx,58,170,784,840,42);ctx.fill();ctx.fillStyle=p.accent;ctx.font="700 26px sans-serif";ctx.fillText('阅见 · 阅读书签',105,235);
+    ctx.fillStyle=p.ink;const length=Array.from(item.quote).length,size=length>260?32:length>150?37:length>80?43:49;ctx.font=`600 ${size}px serif`;const lines=this.bookmarkLines(ctx,'“'+item.quote+'”',690,12),height=lines.length*Math.round(size*1.65);let y=Math.max(350,560-height/2);lines.forEach(line=>{ctx.fillText(line,105,y);y+=Math.round(size*1.65)});
+    ctx.strokeStyle=p.accent;ctx.globalAlpha=.55;ctx.beginPath();ctx.moveTo(105,850);ctx.lineTo(795,850);ctx.stroke();ctx.globalAlpha=1;ctx.fillStyle=p.ink;ctx.font='700 28px sans-serif';ctx.fillText('《'+String(item.bookTitle).slice(0,28)+'》',105,910);ctx.fillStyle=p.muted;ctx.font='400 22px sans-serif';ctx.fillText(String(item.chapterTitle||'阅读摘录').slice(0,36),105,952);ctx.font='400 20px sans-serif';ctx.fillText(item.stamp,105,985);ctx.fillStyle=p.ink;ctx.font='600 23px sans-serif';ctx.fillText('在字里行间，遇见更辽阔的世界',105,1094);ctx.fillStyle=p.accent;ctx.font='700 24px serif';ctx.textAlign='right';ctx.fillText('YUEJIAN',795,1094);
+    return canvas.toDataURL('image/png');
+  };
+  F.ensureBookmarkPreview = function(){
+    if(document.getElementById('bookmarkPreview'))return;
+    document.body.insertAdjacentHTML('beforeend','<div id="bookmarkPreview" class="bookmark-preview hidden"><section class="bookmark-preview-card"><header><div><small>分享书签</small><h2>图片已生成</h2></div><button id="bookmarkPreviewClose" aria-label="关闭">×</button></header><div class="bookmark-preview-image"><img id="bookmarkPreviewImage" alt="阅读书签图片预览"></div><p>书签颜色已跟随当前阅读主题，确认后可保存为 PNG 图片。</p><footer><button id="bookmarkPreviewCancel">暂不保存</button><button id="bookmarkPreviewSave" class="action">保存到本地</button></footer></section></div>');
+    const close=()=>{document.getElementById('bookmarkPreview').classList.add('hidden');this.bookmarkPreview=null};document.getElementById('bookmarkPreviewClose').onclick=close;document.getElementById('bookmarkPreviewCancel').onclick=close;document.getElementById('bookmarkPreview').onclick=e=>{if(e.target.id==='bookmarkPreview')close()};
+    document.getElementById('bookmarkPreviewSave').onclick=()=>{if(!this.bookmarkPreview)return;if(Yuejian.saveBookmarkImage){Yuejian.saveBookmarkImage(this.bookmarkPreview.filename,this.bookmarkPreview.image);close()}else A.toast('当前版本暂不支持保存书签图片')};
   };
   F.shareSelection = function () {
     const quote = this.currentSelectionText(); if (!quote) return;
-    const chapter = this.selectionInfo?.chapter ?? A.chapter, item = {id:'share-'+Date.now().toString(36),bookId:A.book.id,bookTitle:A.book.title,chapter,chapterTitle:A.book.chapters[chapter]?.title||'',quote,created:Date.now()};
+    const chapter = this.selectionInfo?.chapter ?? A.chapter,created=Date.now(),item = {id:'share-'+created.toString(36),bookId:A.book.id,bookTitle:A.book.title,chapter,chapterTitle:A.book.chapters[chapter]?.title||`第 ${chapter+1} 章`,quote,created,stamp:new Intl.DateTimeFormat('zh-CN',{dateStyle:'medium',timeStyle:'short'}).format(new Date(created))};
     const saved = readState('shareBookmarks',[]); saved.unshift(item); saveState('shareBookmarks',saved.slice(0,300));
-    const text = this.shareBookmarkText();
-    if (Yuejian.shareText) Yuejian.shareText('《'+A.book.title+'》阅读书签', text); else navigator.share?.({title:A.book.title,text});
+    this.ensureBookmarkPreview();this.bookmarkPreview={image:this.createBookmarkImage(item),filename:`${item.bookTitle}-阅读书签-${new Date(created).toISOString().slice(0,10)}.png`};document.getElementById('bookmarkPreviewImage').src=this.bookmarkPreview.image;document.getElementById('bookmarkPreview').classList.remove('hidden');this.hideSelection();
   };
   F.selectWholeParagraph = function () {
     const selection = getSelection(); if (!selection.rangeCount) return;
@@ -367,10 +395,22 @@
   };
   F.translateSelection = async function () {
     const quote = this.currentSelectionText(); if (!quote) return;
-    this.hideSelection(); this.showReaderMode('qa');
-    document.getElementById('qaList').insertAdjacentHTML('beforeend',`<div class="qa-msg user">翻译选段：${esc(quote.slice(0,300))}</div><div class="qa-msg ai pending">翻译中…</div>`);
-    const target=document.getElementById('qaList').lastElementChild;
-    try { target.textContent=await nativeAsync('translateSelection',A.book.id,quote); } catch(error) { target.textContent=error.message; }
+    this.hideSelection();this.showTranslationResult('快速翻译','正在连接基础翻译服务…','只发送当前选中的文字',true);
+    try { const result=await nativeAsync('basicTranslateSelection',quote);this.showTranslationResult('快速翻译',result.translation||'',`${result.provider||'MyMemory'}${result.cached?' · 本地缓存':' · 联网结果'}`); } catch(error) { this.showTranslationResult('暂时无法翻译',error.message,'可检查网络后重试，或改用 AI 翻译',false,true); }
+  };
+  F.showTranslationResult=function(title,text,meta,loading=false,error=false){
+    let sheet=document.getElementById('readerTranslationResult');if(!sheet){sheet=document.createElement('div');sheet.id='readerTranslationResult';sheet.className='reader-translation-result';sheet.innerHTML='<section><header><div><small id="readerTranslationMeta"></small><h2 id="readerTranslationTitle"></h2></div><button data-close aria-label="关闭">×</button></header><div id="readerTranslationBody" class="reader-translation-body"></div><footer><button id="copyReaderTranslation">复制译文</button><button class="action" data-close>继续阅读</button></footer></section>';document.body.appendChild(sheet);sheet.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>sheet.classList.add('hidden'));sheet.onclick=event=>{if(event.target===sheet)sheet.classList.add('hidden')};document.getElementById('copyReaderTranslation').onclick=()=>{const value=document.getElementById('readerTranslationBody').textContent||'';if(Yuejian.copyText)Yuejian.copyText(value)}}
+    document.getElementById('readerTranslationTitle').textContent=title;document.getElementById('readerTranslationMeta').textContent=meta||'阅读页内翻译';const body=document.getElementById('readerTranslationBody');body.textContent=text||'';body.classList.toggle('loading',loading);body.classList.toggle('error',error);sheet.classList.remove('hidden');
+  };
+  F.openAiTranslation = function(){
+    const quote=this.currentSelectionText();if(!quote)return;this.hideSelection();document.getElementById('aiTranslationSheet')?.remove();
+    const sheet=document.createElement('div');sheet.id='aiTranslationSheet';sheet.className='ai-translation-sheet';sheet.innerHTML='<section><header><div><small>AI 高级翻译</small><h2>告诉 AI 你希望怎样翻译</h2></div><button data-close aria-label="关闭">×</button></header><div class="ai-translation-presets"><button data-preset="准确自然，保留专名与术语">准确自然</button><button data-preset="采用文学化表达，保留原文节奏和意象">文学表达</button><button data-preset="逐句直译，并在每句后简要解释难词">逐句解释</button><button data-preset="采用严谨的学术中文，保留专业术语">学术风格</button></div><label>自然语言要求<textarea maxlength="300" placeholder="例如：译成自然的中文，保留音乐史术语，并解释拉丁文名称"></textarea></label><p>将使用 AI 设置中的模型并消耗相应 API 额度。</p><footer><button data-close>取消</button><button class="action" data-run>开始 AI 翻译</button></footer></section>';
+    document.body.appendChild(sheet);const input=sheet.querySelector('textarea');sheet.querySelectorAll('[data-preset]').forEach(button=>button.onclick=()=>{input.value=button.dataset.preset;input.focus()});sheet.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>sheet.remove());sheet.onclick=event=>{if(event.target===sheet)sheet.remove()};
+    sheet.querySelector('[data-run]').onclick=()=>{const requirement=input.value.trim();sheet.remove();this.runAiTranslation(quote,requirement)};setTimeout(()=>input.focus(),50);
+  };
+  F.runAiTranslation=async function(quote,requirement){
+    this.showTranslationResult('AI 正在按要求翻译…',requirement||'准确、自然，保留原文语气与专名','将使用当前 AI 模型',true);
+    try{this.showTranslationResult('AI 高级翻译',await nativeAsync('translateSelection',A.book.id,quote,requirement),'当前 AI 模型')}catch(error){this.showTranslationResult('AI 翻译失败',error.message,'请检查 AI 设置或接口额度',false,true)}
   };
   F.selectionLocator = function (root, range, quote) {
     const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode:node=>node.parentElement.closest('.chapter-divider,.annotation-note,.reader-mark')?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT});
@@ -437,6 +477,34 @@
     return `<div class="donut-wrap"><div class="donut" style="background:conic-gradient(${parts.join(',')||'#334b78 0 360deg'})"><b>${domains.length}</b><span>阅读领域</span></div><div class="donut-legend">${domains.slice(0,5).map((row,i)=>`<div><i style="background:${colors[i]}"></i><span>${esc(row.name)}</span><b>${Math.round(row.seconds/Math.max(1,total)*100)}%</b></div>`).join('')}</div></div>`;
   };
   F.reportGauge = function (seconds) { const percent=Math.min(100,Math.round(seconds/3600*100));return `<div class="focus-gauge" style="--focus:${percent*3.6}deg"><div><b>${formatTime(seconds)}</b><span>今日专注</span></div></div><p class="gauge-caption">${percent>=100?'已完成一小时深度阅读，今天的专注很扎实。':`距离一小时专注目标还差 ${formatTime(Math.max(0,3600-seconds))}。`}</p>`; };
+  F.installQaTopics = function(){
+    const pane=document.querySelector('#qaPane .analysis-wrap');if(!pane)return;
+    pane.innerHTML='<section class="qa-topic-panel"><header><div><small>随书资料</small><h3>问答议题</h3></div><button id="qaNewTopic" class="small-action">＋ 新议题</button></header><div id="qaTopicList" class="qa-topic-list"></div></section><div id="qaList" class="qa-list"></div><div class="qa-form"><input id="qaInput" placeholder="输入新议题的问题…"><button id="qaSend" class="action">发送</button></div>';
+    document.getElementById('qaNewTopic').onclick=()=>{this.activeQaTopic='';this.renderQaTopics();document.getElementById('qaInput').focus()};document.getElementById('qaSend').onclick=()=>this.ask();document.getElementById('qaInput').onkeydown=e=>{if(e.key==='Enter'&&!e.isComposing)this.ask()};
+    document.body.insertAdjacentHTML('beforeend','<div id="qaTopicEditor" class="qa-topic-editor hidden"><section><header><div><small>资料议题</small><h2>编辑问答内容</h2></div><button id="qaTopicEditorClose">×</button></header><label>议题名称<input id="qaTopicEditorTitle" maxlength="80"></label><div id="qaTopicEditorMessages"></div><footer><button id="qaTopicDelete" class="danger">删除议题</button><span></span><button id="qaTopicEditorCancel">取消</button><button id="qaTopicEditorSave" class="action">保存修改</button></footer></section></div>');
+    const close=()=>{document.getElementById('qaTopicEditor').classList.add('hidden');const b=document.getElementById('qaTopicDelete');b.dataset.confirm='';b.textContent='删除议题'};document.getElementById('qaTopicEditorClose').onclick=close;document.getElementById('qaTopicEditorCancel').onclick=close;document.getElementById('qaTopicEditor').onclick=e=>{if(e.target.id==='qaTopicEditor')close()};
+    const oldShow=this.showReaderMode.bind(this);this.showReaderMode=mode=>{oldShow(mode);if(mode==='qa')this.renderQaTopics()};
+  };
+  F.qaTopics = function(){
+    const raw=parse(Yuejian.getStates('yuejian-qa-topic-'),{}),topics=[];Object.values(raw).forEach(value=>{try{const topic=typeof value==='string'?JSON.parse(value):value;if(topic&&topic.bookId===A.book?.id)topics.push(topic)}catch{}});return topics.sort((a,b)=>(+b.updatedAt||0)-(+a.updatedAt||0));
+  };
+  F.saveQaTopic=function(topic){topic.updatedAt=+topic.updatedAt||Date.now();topic.messages=Array.isArray(topic.messages)?topic.messages.slice(-80).map(message=>({...message,content:String(message.content||'').slice(0,5000)})):[];saveState('yuejian-qa-topic-'+topic.id,topic)};
+  F.renderQaTopics=function(){
+    if(!A.book||!document.getElementById('qaTopicList'))return;const topics=this.qaTopics().filter(x=>!x.deleted);if(this.activeQaTopic&&!topics.some(x=>x.id===this.activeQaTopic))this.activeQaTopic='';if(!this.activeQaTopic&&topics.length)this.activeQaTopic=topics[0].id;
+    const list=document.getElementById('qaTopicList');list.innerHTML=topics.length?topics.map(t=>`<article class="qa-topic-chip ${t.id===this.activeQaTopic?'active':''}" data-topic="${esc(t.id)}"><button class="qa-topic-open"><b>${esc(t.title||'未命名议题')}</b><span>${t.messages?.length||0} 条记录</span></button><button class="qa-topic-edit" aria-label="编辑">•••</button></article>`).join(''):'<div class="qa-topic-empty">提出问题后会自动保存为资料议题，可继续追问和整理。</div>';
+    list.querySelectorAll('.qa-topic-open').forEach(button=>button.onclick=()=>{this.activeQaTopic=button.parentElement.dataset.topic;this.renderQaTopics()});list.querySelectorAll('.qa-topic-edit').forEach(button=>button.onclick=()=>this.openQaTopicEditor(button.parentElement.dataset.topic));
+    const topic=topics.find(x=>x.id===this.activeQaTopic),thread=document.getElementById('qaList');thread.innerHTML=topic?(topic.messages||[]).map(m=>`<div class="qa-msg ${m.role==='user'?'user':'ai'}"><b>${m.role==='user'?'我的问题':'阅见回答'}</b><span>${esc(m.content)}</span></div>`).join(''):'<div class="qa-topic-welcome"><b>新建议题</b><p>输入一个关于本书的问题，回答会保存到本书资料并参与账户同步。</p></div>';document.getElementById('qaInput').placeholder=topic?'继续追问这个议题…':'输入新议题的问题…';thread.scrollTop=thread.scrollHeight;
+  };
+  F.openQaTopicEditor=function(id){
+    const topic=this.qaTopics().find(x=>x.id===id&&!x.deleted);if(!topic)return;const modal=document.getElementById('qaTopicEditor'),title=document.getElementById('qaTopicEditorTitle'),messages=document.getElementById('qaTopicEditorMessages'),del=document.getElementById('qaTopicDelete');modal.dataset.topic=id;title.value=topic.title||'';messages.innerHTML=(topic.messages||[]).map((m,i)=>`<label>${m.role==='user'?'问题':'回答'}<textarea data-message="${i}" rows="${m.role==='user'?3:6}">${esc(m.content)}</textarea></label>`).join('');del.dataset.confirm='';del.textContent='删除议题';
+    del.onclick=()=>{if(!del.dataset.confirm){del.dataset.confirm='yes';del.textContent='再次点击确认删除';return}topic.deleted=true;topic.updatedAt=Date.now();this.saveQaTopic(topic);if(this.activeQaTopic===id)this.activeQaTopic='';modal.classList.add('hidden');this.renderQaTopics();A.toast('议题已删除并等待同步')};
+    document.getElementById('qaTopicEditorSave').onclick=()=>{topic.title=title.value.trim().slice(0,80)||'未命名议题';messages.querySelectorAll('textarea').forEach(field=>{const m=topic.messages[+field.dataset.message];if(m){m.content=field.value.trim().slice(0,20000);m.updatedAt=Date.now()}});topic.updatedAt=Date.now();this.saveQaTopic(topic);modal.classList.add('hidden');this.renderQaTopics();A.toast('议题已更新')};modal.classList.remove('hidden');
+  };
+  F.ask=async function(prefill){
+    if(!A.book)return;const input=document.getElementById('qaInput'),question=String(prefill||input.value).trim();if(!question)return;let topic=this.qaTopics().find(x=>x.id===this.activeQaTopic&&!x.deleted);const now=Date.now();if(!topic){topic={id:'qa-'+now.toString(36)+Math.random().toString(36).slice(2,8),bookId:A.book.id,bookTitle:A.book.title,title:question.slice(0,36),createdAt:now,updatedAt:now,messages:[]};this.activeQaTopic=topic.id}const context=topic.messages.slice(-10).map(m=>(m.role==='user'?'读者：':'阅见：')+m.content).join('\n\n');topic.messages.push({id:'msg-'+now.toString(36),role:'user',content:question,createdAt:now,updatedAt:now});topic.updatedAt=now;this.saveQaTopic(topic);input.value='';this.renderQaTopics();document.getElementById('qaList').insertAdjacentHTML('beforeend','<div class="qa-msg ai pending">正在结合原文思考…</div>');document.getElementById('qaSend').disabled=true;
+    try{const prompt=context?`这是同一资料议题中的继续追问。请结合此前讨论与书中内容回答最新问题。\n\n此前讨论：\n${context.slice(-8000)}\n\n最新问题：${question}`:question,reply=await nativeAsync('askBook',A.book.id,prompt),finished=Date.now();topic.messages.push({id:'msg-'+finished.toString(36),role:'assistant',content:reply,createdAt:finished,updatedAt:finished});topic.updatedAt=finished;this.saveQaTopic(topic);this.renderQaTopics()}catch(error){this.renderQaTopics();A.toast(error.message)}finally{document.getElementById('qaSend').disabled=false}
+  };
+
   F.reportTable = function (books) { return `<div class="report-table-wrap"><table class="report-table"><thead><tr><th>书籍</th><th>领域</th><th>时长</th><th>阅读量</th></tr></thead><tbody>${books.map(book=>`<tr><td>${esc(book.name)}</td><td>${esc(book.domain)}</td><td>${formatTime(book.seconds)}</td><td>${book.chars.toLocaleString()} 字</td></tr>`).join('')||'<tr><td colspan="4">这个周期还没有阅读记录</td></tr>'}</tbody></table></div>`; };
   F.renderReport = async function (period) {
     this.reportScale=period;const box=document.getElementById('reportContent');box.setAttribute('aria-busy','true');
@@ -475,5 +543,5 @@
   };
   F.changeQuotePage=function(step){this.quotePage=(Number(this.quotePage)||0)+step;this.renderQuotes();document.getElementById('quoteList')?.scrollIntoView({behavior:'smooth',block:'start'});};
 
-  A.showAbout = () => A.toast('阅见 Android 1.2.3 · AI 报告跨端同步');
+  A.showAbout = () => A.toast('阅见 Android 1.2.8 · 阅读页内翻译');
 })();

@@ -1,15 +1,31 @@
-# 阅见 Reader 1.4.3
+# 阅见 Reader 1.4.8
 
 阅见是一款面向 Windows、Android 手机和平板的本地优先 AI 电子书阅读器，支持 EPUB/TXT 阅读、分章深度分析、精确批注、多色高亮、阅读报告、本地书架和多种阅读主题。
 
-![阅见 Windows 星空主题界面](docs/screenshots/windows-starry.png)
+## 新版界面
+
+### Windows 桌面端 1.4.8
+
+![阅见 Windows 桌面端 1.4.8 星空主题](docs/screenshots/desktop-v1.4.8.png)
+
+### Android 手机与平板端 1.2.8
+
+<p align="center">
+  <img src="docs/screenshots/mobile-v1.2.8.jpg" width="420" alt="阅见 Android 1.2.8 星空主题书架">
+</p>
 
 ## 直接使用
 
-运行：
+请前往 [v1.4.8 Release 下载页](https://github.com/ANTARSKYE/yuejian-reader/releases/tag/v1.4.8) 获取正式安装包：
+
+- `Yuejian-Reader-Windows-1.4.8.exe`：Windows 10/11 64 位桌面端。
+- `Yuejian-Reader-Android-1.2.8.apk`：Android 8.0 及以上手机和平板端。
+- `Yuejian-Sync-Server.exe`：按需开启的账户与局域网同步服务器。
+
+本地构建后的 Windows 程序位于：
 
 ```text
-dist/Yuejian-Reader-1.4.3.exe
+dist/Yuejian-Reader-1.4.8.exe
 ```
 
 Android 正式安装包构建后位于：
@@ -29,6 +45,11 @@ android/release/Yuejian-Android.apk
 - AI 报告结构校验、完整结果原子保存和二次补充修订。
 - 连续滑动和左右翻页，章节可持续衔接。
 - 原文选段、精确批注、多色高亮、删除标记和 AI 选段解析。
+- 原文选段支持零配置的 MyMemory 联网快速翻译，以及可用自然语言指定风格的 AI 高级翻译。
+- 选段可生成与当前主题配色一致的 PNG 阅读书签，预览确认后再保存到本地。
+- Windows 书签图片固定保存到“下载/阅见书签”；Android 固定保存到系统相册的“阅见”相册。
+- 自动识别 AI 服务商返回的余额或额度不足错误，并明确提示检查计费账户或充值。
+- 随书问答会保存为资料议题，支持继续追问、重命名、编辑问答和跨端同步删除。
 - 本地书架、封面、阅读进度、日/周/月/年阅读报告。
 - 中文维基文库、Project Gutenberg 和自定义书库网站入口。
 - 主题、自定义背景、本地头像和名言库。
@@ -37,6 +58,15 @@ android/release/Yuejian-Android.apk
 - 可选账户模式与偶尔在线同步：Windows 按需作为局域网服务器，关闭服务器后各端继续本地使用。
 - 多端书架取并集，阅读统计按设备贡献累加；删除书籍、批注和报告会同步删除墓碑。
 - 已生成的 AI 报告可跨端查看，接收端无需配置 API 密钥，也不会重复分析。
+
+## 本机文件位置
+
+- Windows 导入书籍：`%LOCALAPPDATA%\Yuejian\library`
+- Windows 分享书签：`%USERPROFILE%\Downloads\阅见书签`
+- Android 导入书籍：应用内部存储（由 Android 管理，仅阅见可直接访问）
+- Android 分享书签：系统相册 `Pictures/阅见`
+
+软件的“我的/个人资料”页会同时显示这些位置。路径采用固定设置，不再提供修改入口。
 
 ## 账户与多端同步
 
@@ -95,12 +125,12 @@ cd android
 2. 安装 `requirements-build.txt` 中锁定的依赖。
 3. 运行 Python 测试。
 4. 使用 PyInstaller 生成单文件 Windows 程序。
-5. 运行 `reader.exe --self-test` 验证打包产物。
+5. 运行 `Yuejian-Reader-1.4.8.exe --self-test` 验证打包产物。
 
 最终产物固定为：
 
 ```text
-dist/reader.exe
+dist/Yuejian-Reader-1.4.8.exe
 ```
 
 ## 项目结构

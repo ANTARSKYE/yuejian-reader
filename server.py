@@ -23,7 +23,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email import policy
 from email.parser import BytesParser
-from html import escape
+from html import escape, unescape
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
@@ -38,7 +38,7 @@ from sync_local import LocalSyncManager
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Yuejian"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.4.3"
+VERSION = "1.4.8"
 CACHE_FILE = APP_DATA_DIR / "analysis-cache.json"
 TIMING_FILE = APP_DATA_DIR / "analysis-timings.json"
 CHUNK_CACHE_FILE = APP_DATA_DIR / "analysis-chunks.json"
@@ -46,11 +46,14 @@ AI_CONFIG_FILE = APP_DATA_DIR / "ai-config.secure.json"
 LIBRARY_DIR = APP_DATA_DIR / "library"
 LIBRARY_FILE = APP_DATA_DIR / "library.json"
 UI_STATE_FILE = APP_DATA_DIR / "ui-state.json"
+TRANSLATION_CACHE_FILE = APP_DATA_DIR / "translation-cache.json"
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD = 30 * 1024 * 1024
 MAX_UI_STATE = 16 * 1024 * 1024
 MAX_AI_CHARS = 240_000
 MAX_JSON_BODY = 1 * 1024 * 1024
+MAX_BOOKMARK_IMAGE = 8 * 1024 * 1024
+MAX_TRANSLATION_CHARS = 4_000
 LOGGER = configure_logging(APP_DATA_DIR)
 AI_CONFIG = {"provider": "deepseek", "key": "", "model": "deepseek-v4-flash"}
 GUTENBERG_HOST = "www.gutenberg.org"
@@ -1336,7 +1339,110 @@ def storage_status():
             categories["logs"] += size
         else:
             categories["settings"] += size
-    return {"categories": categories, "total": sum(categories.values()), "sessions": len(SESSIONS)}
+    return {
+        "categories": categories,
+        "total": sum(categories.values()),
+        "sessions": len(SESSIONS),
+        "bookPath": str(LIBRARY_DIR),
+        "bookmarkPath": str(default_bookmark_folder()),
+    }
+
+
+def translation_chunks(text, byte_limit=450):
+    """Split text without breaking UTF-8 code points, preferring sentence boundaries."""
+    text = str(text or "").strip()
+    if not text:
+        return []
+    chunks, current = [], ""
+    pieces = re.split(r"(?<=[。！？!?；;\.])\s*|(?<=\n)", text)
+    for piece in pieces:
+        if not piece:
+            continue
+        for char in piece:
+            candidate = current + char
+            if current and len(candidate.encode("utf-8")) > byte_limit:
+                chunks.append(current.strip())
+                current = char
+            else:
+                current = candidate
+        if current and len(current.encode("utf-8")) >= byte_limit * 0.72:
+            chunks.append(current.strip())
+            current = ""
+    if current.strip():
+        chunks.append(current.strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _translate_mymemory_chunk(text, source, target):
+    query = urlencode({"q": text, "langpair": f"{source}|{target}", "mt": "1"})
+    request = urllib.request.Request(
+        "https://api.mymemory.translated.net/get?" + query,
+        headers={"User-Agent": f"YuejianReader/{VERSION}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            raw = response.read(1_000_001)
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise ValueError("基础翻译服务暂时无法连接，请检查网络后重试。") from error
+    if len(raw) > 1_000_000:
+        raise ValueError("基础翻译服务返回的数据异常。")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        status = int(payload.get("responseStatus", 0))
+        translated = unescape(str(payload.get("responseData", {}).get("translatedText", ""))).strip()
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("基础翻译服务返回了无法识别的结果。") from error
+    if status != 200 or not translated:
+        detail = str(payload.get("responseDetails", "")).strip()
+        if "quota" in detail.lower() or "limit" in detail.lower():
+            raise ValueError("基础翻译今日公共额度暂不可用，请稍后重试或使用 AI 翻译。")
+        raise ValueError("基础翻译暂时没有返回结果，请稍后重试。")
+    return translated
+
+
+def basic_translate(text):
+    source_text = str(text or "").strip()
+    if not source_text:
+        raise ValueError("请先选择需要翻译的原文。")
+    if len(source_text) > MAX_TRANSLATION_CHARS:
+        raise ValueError(f"快速翻译每次最多 {MAX_TRANSLATION_CHARS} 个字符，请缩短选段。")
+    mostly_chinese = sum("\u4e00" <= char <= "\u9fff" for char in source_text) > max(2, len(source_text) // 8)
+    source, target = ("zh-CN", "en") if mostly_chinese else ("autodetect", "zh-CN")
+    cache_key = hashlib.sha256(f"mymemory-v1\n{source}\n{target}\n{source_text}".encode("utf-8")).hexdigest()
+    cache = read_json(TRANSLATION_CACHE_FILE, {})
+    cached = cache.get(cache_key, {}) if isinstance(cache, dict) else {}
+    if isinstance(cached, dict) and cached.get("text"):
+        return {"translation": cached["text"], "target": target, "provider": "MyMemory", "cached": True}
+    chunks = translation_chunks(source_text)
+    if len(chunks) > 20:
+        raise ValueError("选段分句过多，请缩短后重试。")
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
+        futures = [pool.submit(_translate_mymemory_chunk, chunk, source, target) for chunk in chunks]
+        translated = "\n".join(future.result() for future in futures)
+
+    def update_cache(current):
+        current = current if isinstance(current, dict) else {}
+        current[cache_key] = {"text": translated, "target": target, "savedAt": int(time.time())}
+        if len(current) > 500:
+            current = dict(sorted(current.items(), key=lambda item: item[1].get("savedAt", 0), reverse=True)[:500])
+        return current
+
+    update_json(TRANSLATION_CACHE_FILE, {}, update_cache)
+    return {"translation": translated, "target": target, "provider": "MyMemory", "cached": False}
+
+
+def advanced_translate(text, requirement=""):
+    source_text = str(text or "").strip()
+    requirement = str(requirement or "").strip()
+    if not source_text or len(source_text) > 8_000:
+        raise ValueError("请选择不超过 8000 个字符的原文。")
+    if len(requirement) > 300:
+        raise ValueError("翻译要求最多 300 个字符。")
+    mostly_chinese = sum("\u4e00" <= char <= "\u9fff" for char in source_text) > max(2, len(source_text) // 8)
+    target = "英文" if mostly_chinese else "简体中文"
+    style = requirement or "准确、自然，保留原文语气、专名、段落和标点"
+    instructions = f"你是专业翻译。把用户原文翻译为{target}。用户的翻译要求：{style}。只输出译文；除非用户明确要求解释，否则不要添加说明。"
+    return {"translation": ai_request(instructions, source_text), "target": target, "provider": AI_CONFIG["provider"], "cached": False}
 
 
 def delete_library_book(book_hash):
@@ -1499,6 +1605,42 @@ def book_resource(book_hash, resource_path):
         return archive.read(info), content_type
 
 
+def save_bookmark_image(data_url, filename):
+    """Validate a canvas PNG and save it to the user's Downloads folder."""
+    prefix = "data:image/png;base64,"
+    if not isinstance(data_url, str) or not data_url.startswith(prefix):
+        raise ValueError("书签图片格式无效。")
+    encoded = data_url[len(prefix):]
+    if len(encoded) > (MAX_BOOKMARK_IMAGE * 4 // 3) + 8:
+        raise ValueError("书签图片超过大小限制。")
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise ValueError("书签图片数据损坏。") from error
+    if len(image) > MAX_BOOKMARK_IMAGE or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("书签图片不是有效的 PNG 文件。")
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(filename or "阅读书签")).strip(" ._")[:80]
+    safe_name = safe_name or "阅读书签"
+    if not safe_name.lower().endswith(".png"):
+        safe_name += ".png"
+    folder = default_bookmark_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / safe_name
+    if target.exists():
+        stem, suffix = target.stem, target.suffix
+        for number in range(2, 1000):
+            candidate = folder / f"{stem}-{number}{suffix}"
+            if not candidate.exists():
+                target = candidate
+                break
+    atomic_write_bytes(target, image)
+    return {"saved": True, "path": str(target), "bytes": len(image)}
+
+
+def default_bookmark_folder():
+    return Path.home() / "Downloads" / "阅见书签"
+
+
 class App(SimpleHTTPRequestHandler):
     access_token = ""
 
@@ -1619,6 +1761,10 @@ class App(SimpleHTTPRequestHandler):
                 payload = self.read_json(200_000)
                 self.send_json(200, {"quotes": parse_quotes_with_ai(str(payload.get("text", "")))})
                 return
+            if self.path == "/api/bookmark-image":
+                payload = self.read_json(MAX_BOOKMARK_IMAGE * 2)
+                self.send_json(200, save_bookmark_image(payload.get("image"), payload.get("filename")))
+                return
             if self.path == "/api/config":
                 payload = self.read_json(16_000)
                 model = str(payload.get("model", "")).strip()
@@ -1693,6 +1839,14 @@ class App(SimpleHTTPRequestHandler):
                 if event:
                     event.set()
                 self.send_json(200, {"cancelled": bool(event)})
+                return
+            if self.path == "/api/translate/basic":
+                payload = self.read_json(32_000)
+                self.send_json(200, basic_translate(payload.get("text")))
+                return
+            if self.path == "/api/translate/ai":
+                payload = self.read_json(64_000)
+                self.send_json(200, advanced_translate(payload.get("text"), payload.get("requirement")))
                 return
             if self.path == "/api/analyze":
                 payload = self.read_json(16_000)

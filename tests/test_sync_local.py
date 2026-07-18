@@ -50,6 +50,27 @@ def test_login_sync_and_remote_state_application(tmp_path, sync_service):
     assert state["yuejian-theme"] == "starry"
 
 
+def test_qa_topics_sync_as_independent_entities(tmp_path, sync_service):
+    desktop = manager(tmp_path / "desktop")
+    phone = manager(tmp_path / "phone")
+    first = "yuejian-qa-topic-qa-first"
+    second = "yuejian-qa-topic-qa-second"
+    first_value = json.dumps({"id": "qa-first", "bookId": "a" * 64, "title": "第一议题", "messages": [], "updatedAt": 1})
+    second_value = json.dumps({"id": "qa-second", "bookId": "a" * 64, "title": "第二议题", "messages": [], "updatedAt": 2})
+    (tmp_path / "desktop").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "desktop" / "ui-state.json").write_text(json.dumps({first: first_value}), encoding="utf-8")
+    desktop.record_ui_patch({first: first_value})
+    desktop.login(sync_service, "qa-reader", "correct-password", register=True)
+    (tmp_path / "phone").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "phone" / "ui-state.json").write_text(json.dumps({second: second_value}), encoding="utf-8")
+    phone.record_ui_patch({second: second_value})
+    phone.login(sync_service, "qa-reader", "correct-password")
+    desktop.run_sync_once()
+    state = json.loads((tmp_path / "desktop" / "ui-state.json").read_text(encoding="utf-8"))
+    assert json.loads(state[first])["title"] == "第一议题"
+    assert json.loads(state[second])["title"] == "第二议题"
+
+
 def test_offline_does_not_drop_outbox(tmp_path):
     client = manager(tmp_path)
     client.account_file.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +149,8 @@ def test_reading_reports_sum_independent_device_contributions(tmp_path, sync_ser
     reports = json.loads(state["yuejian-reading-stats"])
     assert reports[book_id]["daily"]["2026-07-15"] == 200
     assert reports[book_id]["dailyChars"]["2026-07-15"] == 1500
+    assert reports[book_id]["completed"] == []
+    assert reports[book_id]["sessions"] == 0
 
 
 def test_remote_book_delete_removes_other_device_copy(tmp_path, sync_service):

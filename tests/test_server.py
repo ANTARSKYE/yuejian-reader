@@ -1,4 +1,5 @@
 import hashlib
+import base64
 import http.client
 import io
 import json
@@ -9,6 +10,72 @@ import zipfile
 import pytest
 
 import server
+import ai_client
+
+
+class FakeUrlResponse:
+    def __init__(self, payload):
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self, limit=-1):
+        return self.payload[:limit]
+
+
+def test_basic_translation_uses_public_service_and_local_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "TRANSLATION_CACHE_FILE", tmp_path / "translation-cache.json")
+    calls = []
+
+    def fake_open(request, timeout):
+        calls.append((request.full_url, timeout))
+        return FakeUrlResponse({"responseStatus": 200, "responseData": {"translatedText": "你好世界"}})
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", fake_open)
+    first = server.basic_translate("Hello world")
+    second = server.basic_translate("Hello world")
+    assert first["translation"] == "你好世界" and first["provider"] == "MyMemory"
+    assert second["cached"] is True and len(calls) == 1
+    assert "langpair=autodetect%7Czh-CN" in calls[0][0]
+
+
+def test_translation_chunks_preserve_text_and_utf8_limit():
+    source = "这是一个用于检查 UTF-8 安全分段的句子。" * 80
+    chunks = server.translation_chunks(source)
+    assert "".join(chunks) == source
+    assert all(len(chunk.encode("utf-8")) <= 450 for chunk in chunks)
+
+
+def test_bookmark_image_is_validated_and_saved_to_downloads(tmp_path, monkeypatch):
+    png = b"\x89PNG\r\n\x1a\n" + b"bookmark-image"
+    monkeypatch.setattr(server.Path, "home", classmethod(lambda cls: tmp_path))
+    result = server.save_bookmark_image("data:image/png;base64," + base64.b64encode(png).decode(), '测试:书签.png')
+    target = server.Path(result["path"])
+    assert target.read_bytes() == png
+    assert target.parent.name == "阅见书签"
+    with pytest.raises(ValueError):
+        server.save_bookmark_image("data:image/png;base64," + base64.b64encode(b"not-png").decode(), "bad.png")
+
+
+def test_storage_status_exposes_fixed_local_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.Path, "home", classmethod(lambda cls: tmp_path))
+    status = server.storage_status()
+    assert status["bookPath"] == str(server.LIBRARY_DIR)
+    assert status["bookmarkPath"] == str(tmp_path / "Downloads" / "阅见书签")
+
+
+@pytest.mark.parametrize("status,details", [(402, "payment required"), (429, '{"error":{"code":"insufficient_quota"}}'), (400, "账户余额不足，请充值")])
+def test_ai_balance_errors_are_clear(status, details):
+    assert "余额或可用额度不足" in str(ai_client.api_http_error(status, details))
+
+
+def test_ai_rate_limit_is_not_misreported_as_balance():
+    message = str(ai_client.api_http_error(429, "rate limit exceeded"))
+    assert "请求过于频繁" in message and "余额不足" not in message
 
 
 def build_epub():

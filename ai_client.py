@@ -8,6 +8,22 @@ import urllib.error
 import urllib.request
 
 
+BALANCE_MARKERS = (
+    "insufficient_quota", "insufficient quota", "insufficient balance", "account balance",
+    "billing", "payment required", "credit balance", "recharge", "余额不足", "额度不足", "欠费", "充值",
+)
+
+
+def api_http_error(status, details):
+    text = str(details or "")
+    lowered = text.lower()
+    if status == 402 or any(marker in lowered for marker in BALANCE_MARKERS):
+        return ValueError("AI API 余额或可用额度不足，请前往服务商控制台充值或检查计费账户后重试。")
+    if status == 429:
+        return ValueError("AI API 请求过于频繁或已达到速率限制，请稍后重试。")
+    return ValueError(f"AI 服务返回错误（HTTP {status}）：{text[:400]}")
+
+
 def _openai_output_text(response):
     if response.get("output_text"):
         return response["output_text"]
@@ -65,10 +81,8 @@ def request(config, instructions, user_input, json_output=False, max_tokens=8000
                 return _openai_output_text(data)
         except urllib.error.HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
-            last_error = ValueError(
-                f"AI 服务返回错误（HTTP {error.code}）：{details[:400]}"
-            )
-            if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+            last_error = api_http_error(error.code, details)
+            if "余额或可用额度不足" in str(last_error) or error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
                 break
         except urllib.error.URLError as error:
             last_error = ValueError(f"无法连接 AI 服务：{error.reason}")

@@ -26,15 +26,18 @@ if (-not (Test-Path -LiteralPath $python)) {
     --clean `
     --onefile `
     --windowed `
-    --name reader `
+    --name Yuejian-Reader-1.4.8 `
     --icon "assets\yuejian.ico" `
     --add-data "index.html;." `
     --add-data "assets;assets" `
     --hidden-import webview.platforms.edgechromium `
     --hidden-import clr_loader `
     desktop.py
+if ($LASTEXITCODE -ne 0) {
+    throw "Desktop packaging failed with exit code $LASTEXITCODE. Close any running Yuejian-Reader executable and retry."
+}
 
-$exe = Join-Path $PSScriptRoot "dist\reader.exe"
+$exe = Join-Path $PSScriptRoot "dist\Yuejian-Reader-1.4.8.exe"
 $process = Start-Process -FilePath $exe -ArgumentList "--self-test" -WindowStyle Hidden -Wait -PassThru
 if ($process.ExitCode -ne 0) {
     throw "Packaged self-test failed with exit code $($process.ExitCode)."

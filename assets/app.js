@@ -4,7 +4,7 @@ import { initializePersistentStorage, refreshPersistentStorage } from "./ui-stor
 const launchParameters = new URLSearchParams(location.search);
 if (launchParameters.has("desktop")) {
   document.body.classList.add("desktop");
-  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.4.3";
+  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.4.8";
 }
 if (launchParameters.has("token"))
   history.replaceState(
@@ -31,7 +31,8 @@ let sessionId = "",
   selectedLocator = null,
   currentBookData = null,
   readingActive = false,
-  readingTimer = null;
+  readingTimer = null,
+  activeQaTopicId = "";
 const escapeHtml = (value) =>
   String(value ?? "").replace(
     /[&<>'"]/g,
@@ -491,9 +492,15 @@ function saveCurrentBookProgress() {
 }
 function bookStats() {
   const all = allReadingStats();
-  return (
-    all[currentBookKey] || { seconds: 0, completed: [], daily: {}, sessions: 0 }
-  );
+  const value = all[currentBookKey] && typeof all[currentBookKey] === "object" ? all[currentBookKey] : {};
+  return {
+    ...value,
+    seconds: Number(value.seconds) || 0,
+    completed: Array.isArray(value.completed) ? value.completed : [],
+    daily: value.daily && typeof value.daily === "object" ? value.daily : {},
+    dailyChars: value.dailyChars && typeof value.dailyChars === "object" ? value.dailyChars : {},
+    sessions: Number(value.sessions) || 0,
+  };
 }
 function saveBookStats(stats) {
   const all = allReadingStats();
@@ -955,11 +962,85 @@ async function copyDesktopSelection() {
   await copyTextToClipboard(selectedText);
   showNotice("选中文字已复制。");
 }
+const desktopBookmarkPalettes = {
+  starry: { top: "#06142f", bottom: "#173a78", card: "rgba(10,29,67,.84)", ink: "#f4f7ff", muted: "#b8c8ea", accent: "#86b5ff", glow: "#f6d376" },
+  cat: { top: "#f6dfcf", bottom: "#d99c92", card: "rgba(255,248,239,.88)", ink: "#503632", muted: "#87645d", accent: "#b86d70", glow: "#fff3d3" },
+  night: { top: "#11151f", bottom: "#283044", card: "rgba(22,27,39,.9)", ink: "#f1eee8", muted: "#b5b0a8", accent: "#cba47d", glow: "#dbc893" },
+  blue: { top: "#dcecf6", bottom: "#7ca8c8", card: "rgba(246,251,255,.88)", ink: "#253c4d", muted: "#5d7483", accent: "#477c9d", glow: "#eff8ff" },
+  sepia: { top: "#efe1c5", bottom: "#b88e5f", card: "rgba(255,249,235,.88)", ink: "#4c3927", muted: "#78624b", accent: "#9a6c3e", glow: "#fff2c9" },
+  paper: { top: "#f3eee5", bottom: "#c9bba7", card: "rgba(255,253,248,.9)", ink: "#342f2a", muted: "#71685f", accent: "#7b6654", glow: "#fffdf3" }
+};
+let desktopBookmarkPreview = null;
+function bookmarkPalette() {
+  return desktopBookmarkPalettes[document.body.dataset.theme] || desktopBookmarkPalettes.paper;
+}
+function canvasRoundedRect(context, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  context.beginPath(); context.moveTo(x + r, y); context.arcTo(x + width, y, x + width, y + height, r);
+  context.arcTo(x + width, y + height, x, y + height, r); context.arcTo(x, y + height, x, y, r);
+  context.arcTo(x, y, x + width, y, r); context.closePath();
+}
+function canvasTextLines(context, text, maxWidth, maxLines) {
+  const chars = Array.from(String(text || "").replace(/\s+/g, " ").trim()), lines = [];
+  let line = "";
+  for (const char of chars) {
+    if (context.measureText(line + char).width <= maxWidth || !line) line += char;
+    else { lines.push(line); line = char; if (lines.length === maxLines) break; }
+  }
+  if (lines.length < maxLines && line) lines.push(line);
+  if (lines.join("").length < chars.length && lines.length) {
+    let last = lines[lines.length - 1];
+    while (last && context.measureText(last + "…").width > maxWidth) last = last.slice(0, -1);
+    lines[lines.length - 1] = last.replace(/[，。；、,.!?！？\s]+$/, "") + "…";
+  }
+  return lines;
+}
+function createBookmarkImage(item) {
+  const canvas = document.createElement("canvas"), ctx = canvas.getContext("2d"), palette = bookmarkPalette();
+  canvas.width = 900; canvas.height = 1200;
+  const gradient = ctx.createLinearGradient(0, 0, 900, 1200); gradient.addColorStop(0, palette.top); gradient.addColorStop(1, palette.bottom);
+  ctx.fillStyle = gradient; ctx.fillRect(0, 0, 900, 1200);
+  ctx.globalAlpha = .24; ctx.strokeStyle = palette.glow; ctx.lineWidth = 2;
+  for (let i = 0; i < 6; i++) { ctx.beginPath(); ctx.arc(770, 95, 72 + i * 22, Math.PI * .72, Math.PI * 1.76); ctx.stroke(); }
+  [[95,110,7],[145,185,4],[790,300,6],[110,1020,5],[805,1090,8]].forEach(([x,y,r]) => { ctx.fillStyle = palette.glow; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); });
+  ctx.globalAlpha = 1; ctx.fillStyle = palette.card; canvasRoundedRect(ctx, 58, 170, 784, 840, 42); ctx.fill();
+  ctx.fillStyle = palette.accent; ctx.font = "700 26px 'Microsoft YaHei', sans-serif"; ctx.letterSpacing = "4px"; ctx.fillText("阅见 · 阅读书签", 105, 235);
+  ctx.fillStyle = palette.ink; const length = Array.from(item.quote).length, size = length > 260 ? 32 : length > 150 ? 37 : length > 80 ? 43 : 49;
+  ctx.font = `600 ${size}px Georgia, 'Noto Serif SC', 'Songti SC', serif`;
+  const lines = canvasTextLines(ctx, `“${item.quote}”`, 690, 12), lineHeight = Math.round(size * 1.65), quoteHeight = lines.length * lineHeight;
+  let y = Math.max(350, 560 - quoteHeight / 2);
+  lines.forEach(line => { ctx.fillText(line, 105, y); y += lineHeight; });
+  ctx.strokeStyle = palette.accent; ctx.globalAlpha = .55; ctx.beginPath(); ctx.moveTo(105, 850); ctx.lineTo(795, 850); ctx.stroke(); ctx.globalAlpha = 1;
+  ctx.fillStyle = palette.ink; ctx.font = "700 28px 'Microsoft YaHei', sans-serif"; ctx.fillText(`《${String(item.title).slice(0, 28)}》`, 105, 910);
+  ctx.fillStyle = palette.muted; ctx.font = "400 22px 'Microsoft YaHei', sans-serif"; ctx.fillText(String(item.chapterTitle || "阅读摘录").slice(0, 36), 105, 952);
+  ctx.font = "400 20px 'Microsoft YaHei', sans-serif"; ctx.fillText(item.stamp, 105, 985);
+  ctx.fillStyle = palette.ink; ctx.font = "600 23px 'Microsoft YaHei', sans-serif"; ctx.fillText("在字里行间，遇见更辽阔的世界", 105, 1094);
+  ctx.fillStyle = palette.accent; ctx.font = "700 24px Georgia, serif"; ctx.textAlign = "right"; ctx.fillText("YUEJIAN", 795, 1094); ctx.textAlign = "left";
+  return canvas.toDataURL("image/png");
+}
+function ensureBookmarkPreviewModal() {
+  if (document.getElementById("bookmarkPreviewModal")) return;
+  document.body.insertAdjacentHTML("beforeend", `<div id="bookmarkPreviewModal" class="bookmark-preview-modal" aria-hidden="true"><section class="bookmark-preview-card" role="dialog" aria-modal="true" aria-labelledby="bookmarkPreviewTitle"><header><div><span>分享书签</span><h2 id="bookmarkPreviewTitle">图片已生成</h2></div><button id="bookmarkPreviewClose" aria-label="关闭">×</button></header><div class="bookmark-preview-image"><img id="bookmarkPreviewImage" alt="阅读书签图片预览"></div><p>书签颜色已跟随当前阅读主题。确认后将保存为 PNG 图片。</p><footer><button id="bookmarkPreviewCancel">暂不保存</button><button id="bookmarkPreviewSave" class="primary">保存到本地</button></footer></section></div>`);
+  const modal = document.getElementById("bookmarkPreviewModal"), close = () => { modal.classList.remove("open"); modal.setAttribute("aria-hidden", "true"); desktopBookmarkPreview = null; };
+  document.getElementById("bookmarkPreviewClose").onclick = close; document.getElementById("bookmarkPreviewCancel").onclick = close;
+  modal.onclick = event => { if (event.target === modal) close(); };
+  document.getElementById("bookmarkPreviewSave").onclick = async event => {
+    if (!desktopBookmarkPreview) return;
+    const button = event.currentTarget; button.disabled = true; button.textContent = "正在保存…";
+    try {
+      const response = await fetch("/api/bookmark-image", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: desktopBookmarkPreview.image, filename: desktopBookmarkPreview.filename }) }), data = await response.json();
+      if (!response.ok) throw new Error(data.error || "保存失败");
+      close(); showNotice(`书签图片已保存：${data.path}`);
+    } catch (error) { showNotice(error.message || "书签图片保存失败。", true); }
+    finally { button.disabled = false; button.textContent = "保存到本地"; }
+  };
+}
 async function shareDesktopSelection() {
   if (!selectedText) return;
   const chapter = selectedLocator?.chapter ?? currentChapterIndex,
     created = Date.now(),
-    item = { id: "share-" + created.toString(36), book: currentBookKey, title: currentBookData?.title || "未命名书籍", chapter, chapterTitle: desktopChapterTitle(chapter), quote: selectedText, created };
+    stamp = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(created)),
+    item = { id: "share-" + created.toString(36), book: currentBookKey, title: currentBookData?.title || "未命名书籍", chapter, chapterTitle: desktopChapterTitle(chapter), quote: selectedText, created, stamp };
   let items = [];
   try {
     const saved = JSON.parse(localStorage.getItem("yuejian-share-bookmarks") || "[]");
@@ -967,13 +1048,10 @@ async function shareDesktopSelection() {
   } catch {}
   items.unshift(item);
   localStorage.setItem("yuejian-share-bookmarks", JSON.stringify(items.slice(0, 300)));
-  const stamp = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(created)),
-    text = `《${item.title}》\n${item.chapterTitle}\n\n“${item.quote}”\n\n摘录于 阅见 · ${stamp}`;
-  if (navigator.share) {
-    try { await navigator.share({ title: `《${item.title}》阅读书签`, text }); return; } catch (error) { if (error.name === "AbortError") return; }
-  }
-  await copyTextToClipboard(text);
-  showNotice("分享书签已生成并复制，可直接粘贴分享。");
+  ensureBookmarkPreviewModal();
+  desktopBookmarkPreview = { image: createBookmarkImage(item), filename: `${item.title}-阅读书签-${new Date(created).toISOString().slice(0, 10)}.png` };
+  document.getElementById("bookmarkPreviewImage").src = desktopBookmarkPreview.image;
+  const modal = document.getElementById("bookmarkPreviewModal"); modal.classList.add("open"); modal.setAttribute("aria-hidden", "false");
 }
 function selectWholeDesktopParagraph() {
   const selection = window.getSelection(),
@@ -987,16 +1065,56 @@ function selectWholeDesktopParagraph() {
 }
 async function translateDesktopSelection() {
   if (!selectedText) return;
-  answer.innerHTML = "<b>正在翻译选段…</b>";
+  const text = selectedText;
+  showDesktopTranslationResult("快速翻译", "正在连接基础翻译服务…", "只会发送当前选中的文字，不会上传整本书。", true);
   try {
-    const mostlyChinese = [...selectedText].filter((char) => /[\u4e00-\u9fff]/.test(char)).length > Math.max(2, selectedText.length / 8),
-      response = await fetch("/api/question", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, question: `请把下面原文完整翻译为${mostlyChinese ? "英文" : "简体中文"}，保留段落、语气、专名与标点，只输出译文，不解释：\n${selectedText}` }) }),
+    const response = await fetch("/api/translate/basic", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }),
       data = await response.json();
     if (!response.ok) throw new Error(data.error || "翻译失败");
-    answer.innerHTML = "<b>选段翻译</b>" + escapeHtml(data.answer).replace(/\n/g, "<br>");
+    showDesktopTranslationResult("快速翻译", data.translation, `${data.provider || "MyMemory"}${data.cached ? " · 本地缓存" : " · 联网结果"}`);
   } catch (error) {
-    answer.innerHTML = "<b>暂时无法翻译</b>" + escapeHtml(error.message);
+    showDesktopTranslationResult("暂时无法翻译", error.message, "可检查网络后重试，或改用 AI 翻译。", false, true);
   }
+}
+function ensureDesktopTranslationResult() {
+  if (document.getElementById("desktopTranslationResult")) return;
+  document.body.insertAdjacentHTML("beforeend", `<div class="translation-result-sheet" id="desktopTranslationResult" aria-hidden="true"><section><header><div><small id="desktopTranslationMeta">阅读页内翻译</small><h2 id="desktopTranslationTitle">翻译结果</h2></div><button type="button" id="closeDesktopTranslationResult" aria-label="关闭">×</button></header><div class="translation-result-body" id="desktopTranslationBody"></div><footer><button type="button" id="copyDesktopTranslation">复制译文</button><button type="button" class="primary" id="doneDesktopTranslation">继续阅读</button></footer></section></div>`);
+  const sheet=document.getElementById("desktopTranslationResult"),close=()=>{sheet.classList.remove("open");sheet.setAttribute("aria-hidden","true")};
+  document.getElementById("closeDesktopTranslationResult").onclick=close;document.getElementById("doneDesktopTranslation").onclick=close;sheet.addEventListener("click",event=>{if(event.target===sheet)close()});
+  document.getElementById("copyDesktopTranslation").onclick=()=>copyTextToClipboard(document.getElementById("desktopTranslationBody").textContent||"");
+}
+function showDesktopTranslationResult(title,text,meta="阅读页内翻译",loading=false,error=false){
+  ensureDesktopTranslationResult();const sheet=document.getElementById("desktopTranslationResult"),body=document.getElementById("desktopTranslationBody");
+  document.getElementById("desktopTranslationTitle").textContent=title;document.getElementById("desktopTranslationMeta").textContent=meta;body.textContent=text||"";body.classList.toggle("loading",loading);body.classList.toggle("error",error);sheet.classList.add("open");sheet.setAttribute("aria-hidden","false");
+}
+function ensureDesktopAiTranslationModal() {
+  if (document.getElementById("desktopAiTranslationModal")) return;
+  document.body.insertAdjacentHTML("beforeend", `<div class="ai-translation-modal" id="desktopAiTranslationModal" aria-hidden="true"><section><header><div><small>AI 高级翻译</small><h2>告诉 AI 你希望怎样翻译</h2></div><button type="button" id="closeDesktopAiTranslation" aria-label="关闭">×</button></header><div class="translation-presets"><button type="button" data-translation-preset="准确自然，保留专名与术语">准确自然</button><button type="button" data-translation-preset="采用文学化表达，保留原文节奏和意象">文学表达</button><button type="button" data-translation-preset="逐句直译，并在每句后简要解释难词">逐句解释</button><button type="button" data-translation-preset="采用严谨的学术中文，保留专业术语">学术风格</button></div><label>自然语言要求<textarea id="desktopTranslationRequirement" maxlength="300" placeholder="例如：译成自然的中文，保留音乐史术语，并解释拉丁文名称"></textarea></label><p>AI 翻译会使用“AI 设置”中的服务商与模型，并消耗相应 API 额度。</p><footer><button type="button" id="cancelDesktopAiTranslation">取消</button><button type="button" class="primary" id="runDesktopAiTranslation">开始 AI 翻译</button></footer></section></div>`);
+  const modal = document.getElementById("desktopAiTranslationModal"), input = document.getElementById("desktopTranslationRequirement");
+  modal.querySelectorAll("[data-translation-preset]").forEach((button) => button.onclick = () => { input.value = button.dataset.translationPreset; input.focus(); });
+  const close = () => { modal.classList.remove("open"); modal.setAttribute("aria-hidden", "true"); };
+  document.getElementById("closeDesktopAiTranslation").onclick = close;
+  document.getElementById("cancelDesktopAiTranslation").onclick = close;
+  modal.addEventListener("click", (event) => { if (event.target === modal) close(); });
+  document.getElementById("runDesktopAiTranslation").onclick = async () => {
+    const text = modal.dataset.text || "", requirement = input.value.trim(), button = document.getElementById("runDesktopAiTranslation");
+    if (!text) return close();
+    button.disabled = true; button.textContent = "正在翻译…"; close();
+    showDesktopTranslationResult("AI 正在按要求翻译…", requirement || "准确、自然，保留原文语气与专名", "将使用当前 AI 模型", true);
+    try {
+      const response = await fetch("/api/translate/ai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, requirement }) }), data = await response.json();
+      if (!response.ok) throw new Error(data.error || "AI 翻译失败");
+      showDesktopTranslationResult("AI 高级翻译", data.translation, data.provider || "AI");
+    } catch (error) { showDesktopTranslationResult("AI 翻译失败", error.message, "请检查 AI 设置或接口额度", false, true); }
+    finally { button.disabled = false; button.textContent = "开始 AI 翻译"; }
+  };
+}
+function openDesktopAiTranslation() {
+  if (!selectedText) return;
+  ensureDesktopAiTranslationModal();
+  const modal = document.getElementById("desktopAiTranslationModal");
+  modal.dataset.text = selectedText; modal.classList.add("open"); modal.setAttribute("aria-hidden", "false");
+  setTimeout(() => document.getElementById("desktopTranslationRequirement").focus(), 30);
 }
 function openDesktopAnnotationList() {
   ensureAnnotationSheet();
@@ -1053,6 +1171,7 @@ function initReaderTools() {
   document.getElementById("shareSelection").onclick = shareDesktopSelection;
   document.getElementById("selectParagraph").onclick = selectWholeDesktopParagraph;
   document.getElementById("translateSelection").onclick = translateDesktopSelection;
+  document.getElementById("aiTranslateSelection").onclick = openDesktopAiTranslation;
   document.getElementById("manageAnnotations").onclick = openDesktopAnnotationList;
   document.getElementById("aiExplain").onclick = explainSelection;
   document.getElementById("clearSelection").onclick = () =>
@@ -1319,7 +1438,7 @@ async function loadChapter(index) {
       (data.index + 1) +
       " / " +
       data.total +
-      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><button id="copySelection">复制</button><button id="shareSelection">分享书签</button><button id="selectParagraph">段落全选</button><button id="translateSelection">翻译</button><i class="tool-divider"></i><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
+      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><button id="copySelection">复制</button><button id="shareSelection">分享书签</button><button id="selectParagraph">段落全选</button><button id="translateSelection">快速翻译</button><button id="aiTranslateSelection">AI 翻译</button><i class="tool-divider"></i><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
       data.html +
       '</div><div class="reader-nav"><button id="prevChapter" ' +
       (data.index === 0 ? "disabled" : "") +
@@ -1641,6 +1760,7 @@ function render(data) {
   currentBookData = data;
   title.textContent = data.title;
   currentBookKey = data.book_hash || data.title;
+  renderDesktopQaTopics();
   const savedProgress = allBookProgress()[currentBookKey];
   currentChapterIndex = Math.max(0, Math.min(data.chapters.length - 1, Number(savedProgress?.chapter) || 0));
   migrateLegacyBookData(data.title, currentBookKey);
@@ -1978,30 +2098,87 @@ fileInput.addEventListener("change", (e) => loadBook(e.target.files[0]));
   }),
 );
 drop.addEventListener("drop", (e) => loadBook(e.dataTransfer.files[0]));
+const QA_TOPIC_PREFIX = "yuejian-qa-topic-";
+function desktopQaTopics() {
+  const topics = [];
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (!key?.startsWith(QA_TOPIC_PREFIX)) continue;
+    try { const topic = JSON.parse(localStorage.getItem(key)); if (topic && typeof topic === "object") topics.push(topic); } catch {}
+  }
+  return topics.filter((topic) => topic.bookId === currentBookKey).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+}
+function saveDesktopQaTopic(topic) {
+  topic.updatedAt = Number(topic.updatedAt) || Date.now();
+  topic.messages = Array.isArray(topic.messages) ? topic.messages.slice(-80).map(message => ({ ...message, content: String(message.content || "").slice(0, 5000) })) : [];
+  localStorage.setItem(QA_TOPIC_PREFIX + topic.id, JSON.stringify(topic));
+}
+function ensureDesktopQaUi() {
+  if (document.getElementById("qaTopicBar")) return;
+  answer.insertAdjacentHTML("beforebegin", '<section id="qaTopicBar" class="qa-topic-bar"><header><div><small>随书资料</small><strong>问答议题</strong></div><button id="qaNewTopic">＋ 新议题</button></header><div id="qaTopicList" class="qa-topic-list"></div></section>');
+  document.getElementById("qaNewTopic").onclick = () => { activeQaTopicId = ""; renderDesktopQaTopics(); document.getElementById("question").focus(); };
+  document.body.insertAdjacentHTML("beforeend", '<div id="qaEditorModal" class="qa-editor-modal"><section class="qa-editor-card"><header><div><small>资料议题</small><h2>编辑问答内容</h2></div><button id="qaEditorClose" aria-label="关闭">×</button></header><label>议题名称<input id="qaEditorTitle" maxlength="80"></label><div id="qaEditorMessages"></div><footer><button id="qaEditorDelete" class="danger">删除议题</button><span></span><button id="qaEditorCancel">取消</button><button id="qaEditorSave" class="primary">保存修改</button></footer></section></div>');
+  const close = () => { document.getElementById("qaEditorModal").classList.remove("open"); document.getElementById("qaEditorDelete").dataset.confirm = ""; document.getElementById("qaEditorDelete").textContent = "删除议题"; };
+  document.getElementById("qaEditorClose").onclick = close; document.getElementById("qaEditorCancel").onclick = close;
+  document.getElementById("qaEditorModal").onclick = event => { if (event.target.id === "qaEditorModal") close(); };
+}
+function renderDesktopQaTopics() {
+  ensureDesktopQaUi();
+  const topics = desktopQaTopics().filter((topic) => !topic.deleted);
+  if (activeQaTopicId && !topics.some((topic) => topic.id === activeQaTopicId)) activeQaTopicId = "";
+  if (!activeQaTopicId && topics.length) activeQaTopicId = topics[0].id;
+  const list = document.getElementById("qaTopicList");
+  list.innerHTML = topics.length ? topics.map((topic) => `<article class="qa-topic-chip ${topic.id === activeQaTopicId ? "active" : ""}" data-topic-id="${escapeHtml(topic.id)}"><button class="qa-topic-open"><b>${escapeHtml(topic.title || "未命名议题")}</b><span>${topic.messages?.length || 0} 条记录</span></button><button class="qa-topic-edit" aria-label="编辑议题">•••</button></article>`).join("") : '<div class="qa-topic-empty">提出问题后会自动保存为可继续整理的资料议题。</div>';
+  list.querySelectorAll(".qa-topic-open").forEach(button => button.onclick = () => { activeQaTopicId = button.parentElement.dataset.topicId; renderDesktopQaTopics(); });
+  list.querySelectorAll(".qa-topic-edit").forEach(button => button.onclick = () => openDesktopQaEditor(button.parentElement.dataset.topicId));
+  const topic = topics.find((item) => item.id === activeQaTopicId);
+  answer.innerHTML = topic ? topic.messages.map(message => `<div class="qa-message ${message.role}"><b>${message.role === "user" ? "我的问题" : "阅见回答"}</b><p>${escapeHtml(message.content).replace(/\n/g, "<br>")}</p></div>`).join("") : '<div class="qa-welcome"><b>新建议题</b><p>输入一个关于本书的问题。回答会永久保存在本书资料中，并可继续追问。</p></div>';
+  document.getElementById("question").placeholder = topic ? "继续追问这个议题…" : "输入新议题的问题…";
+  answer.scrollTop = answer.scrollHeight;
+}
+function openDesktopQaEditor(id) {
+  ensureDesktopQaUi(); const topic = desktopQaTopics().find((item) => item.id === id && !item.deleted); if (!topic) return;
+  const modal = document.getElementById("qaEditorModal"), titleInput = document.getElementById("qaEditorTitle"), messages = document.getElementById("qaEditorMessages"), deleteButton = document.getElementById("qaEditorDelete");
+  modal.dataset.topicId = id; titleInput.value = topic.title || "";
+  messages.innerHTML = (topic.messages || []).map((message, index) => `<label>${message.role === "user" ? "问题" : "回答"}<textarea data-message-index="${index}" rows="${message.role === "user" ? 3 : 6}">${escapeHtml(message.content)}</textarea></label>`).join("");
+  deleteButton.dataset.confirm = ""; deleteButton.textContent = "删除议题";
+  deleteButton.onclick = () => { if (!deleteButton.dataset.confirm) { deleteButton.dataset.confirm = "yes"; deleteButton.textContent = "再次点击确认删除"; return; } topic.deleted = true; topic.updatedAt = Date.now(); saveDesktopQaTopic(topic); if (activeQaTopicId === id) activeQaTopicId = ""; modal.classList.remove("open"); renderDesktopQaTopics(); };
+  document.getElementById("qaEditorSave").onclick = () => { topic.title = titleInput.value.trim().slice(0, 80) || "未命名议题"; messages.querySelectorAll("textarea").forEach(field => { const message = topic.messages[Number(field.dataset.messageIndex)]; if (message) { message.content = field.value.trim().slice(0, 20000); message.updatedAt = Date.now(); } }); topic.updatedAt = Date.now(); saveDesktopQaTopic(topic); modal.classList.remove("open"); renderDesktopQaTopics(); showNotice("问答议题已更新。"); };
+  modal.classList.add("open");
+}
 async function ask() {
   const question = document.getElementById("question"),
     button = document.getElementById("askButton");
-  if (!question.value.trim()) return;
+  const rawQuestion = question.value.trim();
+  if (!rawQuestion) return;
   if (!sessionId) {
     answer.innerHTML =
       "<b>请先分析一本书</b>上传书籍后，我才能根据其内容回答。";
     return;
   }
+  let topic = desktopQaTopics().find((item) => item.id === activeQaTopicId && !item.deleted);
+  if (!topic) {
+    const now = Date.now();
+    topic = { id: "qa-" + now.toString(36) + Math.random().toString(36).slice(2, 8), bookId: currentBookKey, bookTitle: currentBookData?.title || "未命名书籍", title: rawQuestion.slice(0, 36), createdAt: now, updatedAt: now, messages: [] };
+    activeQaTopicId = topic.id;
+  }
+  const context = topic.messages.slice(-10).map((message) => `${message.role === "user" ? "读者" : "阅见"}：${message.content}`).join("\n\n"), now = Date.now();
+  topic.messages.push({ id: "msg-" + now.toString(36), role: "user", content: rawQuestion, createdAt: now, updatedAt: now });
+  topic.updatedAt = now; saveDesktopQaTopic(topic); question.value = ""; renderDesktopQaTopics();
   button.disabled = true;
-  answer.innerHTML = "<b>正在查找书中的答案…</b>";
+  answer.insertAdjacentHTML("beforeend", '<div class="qa-message assistant pending"><b>阅见</b><p>正在查找书中的答案…</p></div>');
   try {
+    const prompt = context ? `这是同一资料议题中的继续追问。请结合此前讨论与书中内容回答最新问题。\n\n此前讨论：\n${context.slice(-8000)}\n\n最新问题：${rawQuestion}` : rawQuestion;
     const response = await fetch("/api/question", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, question: question.value }),
+      body: JSON.stringify({ session_id: sessionId, question: prompt }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "回答失败");
-    answer.innerHTML =
-      "<b>回答</b>" + escapeHtml(data.answer).replace(/\n/g, "<br>");
-    question.value = "";
+    const finished = Date.now(); topic.messages.push({ id: "msg-" + finished.toString(36), role: "assistant", content: data.answer, createdAt: finished, updatedAt: finished }); topic.updatedAt = finished; saveDesktopQaTopic(topic); renderDesktopQaTopics();
   } catch (error) {
-    answer.innerHTML = "<b>暂时无法回答</b>" + escapeHtml(error.message);
+    renderDesktopQaTopics(); showNotice(error.message || "暂时无法回答", true);
   } finally {
     button.disabled = false;
   }
@@ -3262,9 +3439,21 @@ document.getElementById("accountLogout").onclick = async () => {
     showNotice("已切换为本地模式，本机书籍和阅读数据均已保留。");
   } catch (error) { showNotice(error.message, true); }
 };
+async function loadLocalStoragePaths() {
+  try {
+    const response = await fetch("/api/storage/status", { cache: "no-store" }), data = await response.json();
+    if (!response.ok) throw new Error(data.error || "无法读取本机保存位置");
+    document.getElementById("desktopBookPath").textContent = data.bookPath || "本机应用数据目录";
+    document.getElementById("desktopBookmarkPath").textContent = data.bookmarkPath || "下载 / 阅见书签";
+  } catch (error) {
+    document.getElementById("desktopBookPath").textContent = "暂时无法读取";
+    document.getElementById("desktopBookmarkPath").textContent = "下载 / 阅见书签";
+  }
+}
 profileButton.onclick = () => {
   applyLocalProfile();
   loadAccountStatus();
+  loadLocalStoragePaths();
   openExclusiveModal(profileModal);
   setTimeout(() => {
     profileNameInput.focus();

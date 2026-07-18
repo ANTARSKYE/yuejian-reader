@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
+Set-Location -LiteralPath $Root
 $Tools = Join-Path $Root "tools"
 $Jdk = Join-Path $Root "tools\jdk"
 $Sdk = Join-Path $Root "sdk"
