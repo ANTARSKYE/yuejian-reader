@@ -8,10 +8,10 @@
 
 ![阅见 Windows 桌面端 1.4.8 星空主题](docs/screenshots/desktop-v1.4.8.png)
 
-### Android 手机与平板端 1.2.8
+### Android 手机与平板端 1.2.9
 
 <p align="center">
-  <img src="docs/screenshots/mobile-v1.2.8.jpg" width="420" alt="阅见 Android 1.2.8 星空主题书架">
+  <img src="docs/screenshots/mobile-v1.2.8.jpg" width="420" alt="阅见 Android 1.2.9 星空主题书架">
 </p>
 
 ## 直接使用
@@ -19,7 +19,7 @@
 请前往 [v1.4.8 Release 下载页](https://github.com/ANTARSKYE/yuejian-reader/releases/tag/v1.4.8) 获取正式安装包：
 
 - `Yuejian-Reader-Windows-1.4.8.exe`：Windows 10/11 64 位桌面端。
-- `Yuejian-Reader-Android-1.2.8.apk`：Android 8.0 及以上手机和平板端。
+- `Yuejian-Reader-Android-1.2.9.apk`：Android 8.0 及以上手机和平板端。
 - `Yuejian-Sync-Server.exe`：按需开启的账户与局域网同步服务器。
 
 本地构建后的 Windows 程序位于：

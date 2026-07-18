@@ -15,7 +15,7 @@ $env:ANDROID_HOME = $Sdk
 $env:ANDROID_SDK_ROOT = $Sdk
 Set-Content -LiteralPath (Join-Path $Root "local.properties") -Value ("sdk.dir=" + ($Sdk -replace '\\','\\')) -Encoding ASCII
 
-& $Gradle --no-daemon clean assembleRelease
+& $Gradle --no-daemon clean assembleRelease bundleRelease
 if ($LASTEXITCODE -ne 0) { throw "Android 构建失败" }
 
 $Release = Join-Path $Root "release"
@@ -40,4 +40,11 @@ if ($LASTEXITCODE -ne 0) { throw "APK 签名失败" }
 Remove-Item -LiteralPath $Aligned -Force
 & (Join-Path $Sdk "build-tools\35.0.0\apksigner.bat") verify --verbose $Output
 if ($LASTEXITCODE -ne 0) { throw "APK 签名校验失败" }
+$UnsignedBundle = Join-Path $Root "app\build\outputs\bundle\release\app-release.aab"
+$BundleOutput = Join-Path $Release "Yuejian-Android-1.2.9.aab"
+& (Join-Path $Jdk "bin\jarsigner.exe") -keystore $Keystore -storepass $Password -keypass $Password -signedjar $BundleOutput $UnsignedBundle yuejian
+if ($LASTEXITCODE -ne 0) { throw "Android App Bundle 签名失败" }
+& (Join-Path $Jdk "bin\jarsigner.exe") -verify $BundleOutput
+if ($LASTEXITCODE -ne 0) { throw "Android App Bundle 签名校验失败" }
 Write-Host "APK: $Release\Yuejian-Android.apk"
+Write-Host "AAB: $BundleOutput"

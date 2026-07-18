@@ -1,14 +1,12 @@
 package com.yuejian.reader;
 
 import android.annotation.SuppressLint;
-import android.Manifest;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.net.Uri;
@@ -36,8 +34,6 @@ import org.json.JSONObject;
 import org.xml.sax.SAXException;
 
 import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.util.Collections;
 import java.util.Locale;
@@ -54,7 +50,7 @@ public class MainActivity extends Activity {
     private static final int EXPORT_BACKUP = 1002;
     private static final int RESTORE_BACKUP = 1003;
     private static final int WEB_FILE = 1004;
-    private static final int WRITE_BOOKMARK_GALLERY = 1005;
+    private static final int SAVE_BOOKMARK_LEGACY = 1005;
     private WebView webView;
     private BookRepository repository;
     private SecureConfig secureConfig;
@@ -210,6 +206,22 @@ public class MainActivity extends Activity {
         if (requestCode == PICK_BOOK && resultCode == RESULT_OK && data != null && data.getData() != null) importUri(data.getData());
         if (requestCode == EXPORT_BACKUP && resultCode == RESULT_OK && data != null && data.getData() != null) backupTo(data.getData());
         if (requestCode == RESTORE_BACKUP && resultCode == RESULT_OK && data != null && data.getData() != null) restoreFrom(data.getData());
+        if (requestCode == SAVE_BOOKMARK_LEGACY) {
+            byte[] image = pendingBookmarkImage;
+            pendingBookmarkImage = null;
+            pendingBookmarkTitle = null;
+            Uri target = resultCode == RESULT_OK && data != null ? data.getData() : null;
+            if (target != null && image != null) executor.execute(() -> {
+                try (OutputStream output = getContentResolver().openOutputStream(target, "w")) {
+                    if (output == null) throw new IllegalStateException("无法创建书签图片");
+                    output.write(image); output.flush();
+                    runOnUiThread(() -> Toast.makeText(this, "书签图片已保存", Toast.LENGTH_SHORT).show());
+                } catch (Exception error) {
+                    String detail = error.getMessage() == null ? "无法保存书签图片" : error.getMessage();
+                    runOnUiThread(() -> Toast.makeText(this, "保存失败：" + detail, Toast.LENGTH_LONG).show());
+                }
+            });
+        }
         if (requestCode == WEB_FILE && webFileCallback != null) {
             Uri[] result = resultCode == RESULT_OK ? WebChromeClient.FileChooserParams.parseResult(resultCode, data) : null;
             webFileCallback.onReceiveValue(result); webFileCallback = null;
@@ -223,53 +235,33 @@ public class MainActivity extends Activity {
         });
     }
 
-    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode != WRITE_BOOKMARK_GALLERY) return;
-        byte[] image = pendingBookmarkImage;
-        String title = pendingBookmarkTitle;
-        pendingBookmarkImage = null;
-        pendingBookmarkTitle = null;
-        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED && image != null && title != null) {
-            saveBookmarkToGallery(title, image);
-        } else {
-            Toast.makeText(this, "未获得相册写入权限，书签图片未保存", Toast.LENGTH_LONG).show();
-        }
-    }
-
     private void saveBookmarkToGallery(String filename, byte[] image) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             pendingBookmarkImage = image;
             pendingBookmarkTitle = filename;
-            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, WRITE_BOOKMARK_GALLERY);
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                    .addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("image/png")
+                    .putExtra(Intent.EXTRA_TITLE, filename);
+            startActivityForResult(intent, SAVE_BOOKMARK_LEGACY);
             return;
         }
         executor.execute(() -> {
             try {
-                Uri target;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    ContentValues values = new ContentValues();
-                    values.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
-                    values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
-                    values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/阅见");
-                    values.put(MediaStore.Images.Media.IS_PENDING, 1);
-                    target = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-                    if (target == null) throw new IllegalStateException("无法创建相册图片");
-                    try (OutputStream output = getContentResolver().openOutputStream(target, "w")) {
-                        if (output == null) throw new IllegalStateException("无法写入相册");
-                        output.write(image); output.flush();
-                    }
-                    ContentValues ready = new ContentValues();
-                    ready.put(MediaStore.Images.Media.IS_PENDING, 0);
-                    getContentResolver().update(target, ready, null, null);
-                } else {
-                    File folder = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "阅见");
-                    if (!folder.exists() && !folder.mkdirs()) throw new IllegalStateException("无法创建阅见相册");
-                    File outputFile = new File(folder, filename);
-                    try (OutputStream output = new FileOutputStream(outputFile)) { output.write(image); output.flush(); }
-                    target = Uri.fromFile(outputFile);
-                    sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, target));
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+                values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+                values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/阅见");
+                values.put(MediaStore.Images.Media.IS_PENDING, 1);
+                Uri target = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (target == null) throw new IllegalStateException("无法创建相册图片");
+                try (OutputStream output = getContentResolver().openOutputStream(target, "w")) {
+                    if (output == null) throw new IllegalStateException("无法写入相册");
+                    output.write(image); output.flush();
                 }
+                ContentValues ready = new ContentValues();
+                ready.put(MediaStore.Images.Media.IS_PENDING, 0);
+                getContentResolver().update(target, ready, null, null);
                 runOnUiThread(() -> Toast.makeText(this, "已保存到系统相册 · 阅见", Toast.LENGTH_SHORT).show());
             } catch (Exception error) {
                 String detail = error.getMessage() == null ? "无法写入相册" : error.getMessage();

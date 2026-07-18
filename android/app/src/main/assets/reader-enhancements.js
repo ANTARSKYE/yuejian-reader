@@ -40,7 +40,7 @@
   const originalInit = F.init.bind(F);
   F.init = function () {
     originalInit();
-    A.showAbout = () => A.toast('阅见 Android 1.2.8 · 阅读页内翻译');
+    A.showAbout = () => A.toast('阅见 Android 1.2.9 · 阅读页内翻译');
     this.installReadingExperience();
     this.installAnnotationUi();
     this.installNavigationFeedback();
@@ -72,7 +72,7 @@
 
   F.installStorageLocationInfo = function(){
     const storage=document.getElementById('storageInfo');if(!storage||document.getElementById('localStorageLocations'))return;
-    storage.insertAdjacentHTML('afterend','<div id="localStorageLocations" class="local-storage-locations"><div><span>导入书籍</span><b>应用内部存储 / 阅见</b><small>由 Android 安全管理，仅本应用与账户同步使用</small></div><div><span>分享书签图片</span><b>系统相册 / Pictures / 阅见</b><small>保存后可直接在相册、微信或其他应用中查看</small></div></div>');
+    storage.insertAdjacentHTML('afterend','<div id="localStorageLocations" class="local-storage-locations"><div><span>导入书籍</span><b>应用内部存储 / 阅见</b><small>由 Android 安全管理，仅本应用与账户同步使用</small></div><div><span>分享书签图片</span><b>Android 10+：系统相册 / Pictures / 阅见</b><small>Android 8–9 使用系统安全保存面板，无需授予存储权限</small></div></div>');
   };
 
   F.installNavigationFeedback = function () {
@@ -543,5 +543,5 @@
   };
   F.changeQuotePage=function(step){this.quotePage=(Number(this.quotePage)||0)+step;this.renderQuotes();document.getElementById('quoteList')?.scrollIntoView({behavior:'smooth',block:'start'});};
 
-  A.showAbout = () => A.toast('阅见 Android 1.2.8 · 阅读页内翻译');
+  A.showAbout = () => A.toast('阅见 Android 1.2.9 · 阅读页内翻译');
 })();

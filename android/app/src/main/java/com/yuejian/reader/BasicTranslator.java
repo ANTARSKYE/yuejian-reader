@@ -57,9 +57,11 @@ final class BasicTranslator {
     }
 
     private static String request(String text, String source, String target) throws Exception {
-        String query = "q=" + URLEncoder.encode(text, StandardCharsets.UTF_8) + "&langpair=" + URLEncoder.encode(source + "|" + target, StandardCharsets.UTF_8) + "&mt=1";
+        // The Charset overload only exists on newer Android releases. The named
+        // charset overload is available across the app's full Android 8+ range.
+        String query = "q=" + URLEncoder.encode(text, "UTF-8") + "&langpair=" + URLEncoder.encode(source + "|" + target, "UTF-8") + "&mt=1";
         HttpURLConnection connection = (HttpURLConnection) new URL("https://api.mymemory.translated.net/get?" + query).openConnection();
-        connection.setConnectTimeout(8000); connection.setReadTimeout(8000); connection.setRequestProperty("User-Agent", "YuejianAndroid/1.2.8");
+        connection.setConnectTimeout(8000); connection.setReadTimeout(8000); connection.setRequestProperty("User-Agent", "YuejianAndroid/1.2.9");
         try {
             int status = connection.getResponseCode();
             InputStream stream = status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream();
