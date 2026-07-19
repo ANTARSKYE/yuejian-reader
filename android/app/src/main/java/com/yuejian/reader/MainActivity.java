@@ -2,6 +2,9 @@ package com.yuejian.reader;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.job.JobInfo;
+import android.app.job.JobScheduler;
+import android.content.ComponentName;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ContentValues;
@@ -140,7 +143,7 @@ public class MainActivity extends Activity {
         webView.setWebViewClient(new WebViewClient() {
             @Override public void onPageFinished(WebView view, String url) {
                 if (accountStore.accountMode()) executor.execute(() -> {
-                    try { notifySyncState(syncManager.syncNow(MainActivity.this::notifySyncProgress)); } catch (Exception ignored) {}
+                    runAutomaticSync();
                 });
                 if (pendingImportUri != null) {
                     Uri uri = pendingImportUri;
@@ -148,11 +151,11 @@ public class MainActivity extends Activity {
                     importUri(uri);
                 }
                 if (automaticSyncStarted.compareAndSet(false, true)) {
-                    automaticSync.scheduleAtFixedRate(() -> {
+                    automaticSync.scheduleWithFixedDelay(() -> {
                         if (!accountStore.accountMode()) return;
-                        try { notifySyncState(syncManager.syncNow(MainActivity.this::notifySyncProgress)); }
-                        catch (Exception ignored) {}
+                        runAutomaticSync();
                     }, 60, 60, TimeUnit.SECONDS);
+                    scheduleDurableSync();
                 }
             }
 
@@ -199,6 +202,30 @@ public class MainActivity extends Activity {
 
     private void notifySyncProgress(JSONObject value) {
         runOnUiThread(() -> webView.evaluateJavascript("window.features&&features.accountSyncProgress(" + JSONObject.quote(value.toString()) + ")", null));
+    }
+
+    private void runAutomaticSync() {
+        try {
+            notifySyncState(syncManager.syncNow(this::notifySyncProgress));
+        } catch (Exception error) {
+            try {
+                accountStore.failed(SyncManager.friendlyMessage(error));
+                notifySyncState(syncManager.status().put("ok", false).put("error", SyncManager.friendlyMessage(error)));
+            } catch (Exception ignored) {
+                runOnUiThread(() -> Toast.makeText(this, "账户同步失败，请稍后重试", Toast.LENGTH_SHORT).show());
+            }
+        }
+    }
+
+    private void scheduleDurableSync() {
+        JobScheduler scheduler = (JobScheduler) getSystemService(Context.JOB_SCHEDULER_SERVICE);
+        if (scheduler == null) return;
+        JobInfo job = new JobInfo.Builder(SyncJobService.JOB_ID, new ComponentName(this, SyncJobService.class))
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                .setPeriodic(15 * 60 * 1000L)
+                .setPersisted(false)
+                .build();
+        scheduler.schedule(job);
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -374,6 +401,14 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface public void readChapterAsync(String requestId, String id, int index) {
             executor.execute(() -> { try { nativeResult(requestId, true, repository.getChapter(id, index)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
+        }
+
+        @JavascriptInterface public void searchBooksAsync(String requestId, String query, String bookId) {
+            executor.execute(() -> { try { nativeResult(requestId, true, repository.searchBooks(query, bookId, 100)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
+        }
+
+        @JavascriptInterface public void updateBookMetadataAsync(String requestId, String id, String json) {
+            executor.execute(() -> { try { nativeResult(requestId, true, repository.updateBookMetadata(id, json)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
         }
 
         @JavascriptInterface public void saveProgress(String id, int chapter, double progress) { repository.updateProgress(id, chapter, progress); }

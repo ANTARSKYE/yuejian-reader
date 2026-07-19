@@ -15,6 +15,7 @@ import secrets
 import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -30,6 +31,10 @@ MAX_BLOB_BODY = 30 * 1024 * 1024
 DISCOVERY_PORT = 8788
 DISCOVERY_REQUEST = b"YUEJIAN_DISCOVER_V1"
 PBKDF2_ITERATIONS = 600_000
+TOKEN_MAX_IDLE_MS = 30 * 24 * 60 * 60 * 1000
+LOGIN_WINDOW_SECONDS = 5 * 60
+LOGIN_LOCK_SECONDS = 10 * 60
+LOGIN_MAX_ATTEMPTS = 8
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,40}$")
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 ENTITY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
@@ -52,10 +57,46 @@ def password_hash(password: str, salt: bytes) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS).hex()
 
 
+class LoginRateLimiter:
+    """Small in-memory guard for a trusted-LAN service; never stores passwords."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._attempts = {}
+
+    def check(self, client: str, username: str):
+        key = (str(client or ""), str(username or "").strip().lower())
+        current = time.monotonic()
+        with self._lock:
+            values = [stamp for stamp in self._attempts.get(key, []) if current - stamp < LOGIN_LOCK_SECONDS]
+            self._attempts[key] = values
+            recent = [stamp for stamp in values if current - stamp < LOGIN_WINDOW_SECONDS]
+            if len(recent) >= LOGIN_MAX_ATTEMPTS:
+                retry = max(1, int(LOGIN_LOCK_SECONDS - (current - values[0])))
+                raise SyncError(429, f"登录尝试过多，请在 {retry} 秒后重试")
+        return key
+
+    def failed(self, key):
+        with self._lock:
+            self._attempts.setdefault(key, []).append(time.monotonic())
+
+    def succeeded(self, key):
+        with self._lock:
+            self._attempts.pop(key, None)
+
+
 class SyncError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+class ClosingConnection(sqlite3.Connection):
+    """SQLite context manager that also releases the file handle on exit."""
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 class SyncStore:
@@ -68,7 +109,7 @@ class SyncStore:
         self._initialize()
 
     def connect(self):
-        connection = sqlite3.connect(self.db_path, timeout=20)
+        connection = sqlite3.connect(self.db_path, timeout=20, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -93,6 +134,7 @@ class SyncStore:
                   operation TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS changes_user_seq ON changes(user_id, server_seq);
+                CREATE INDEX IF NOT EXISTS changes_created_at ON changes(created_at);
                 CREATE TABLE IF NOT EXISTS entities(
                   user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
                   operation TEXT NOT NULL, payload TEXT NOT NULL, updated_at INTEGER NOT NULL,
@@ -106,6 +148,8 @@ class SyncStore:
                   user_id TEXT NOT NULL, sha256 TEXT NOT NULL,
                   PRIMARY KEY(user_id, sha256)
                 );
+                CREATE INDEX IF NOT EXISTS devices_user_seen ON devices(user_id, last_seen_at);
+                CREATE INDEX IF NOT EXISTS entities_user_updated ON entities(user_id, updated_at);
                 """
             )
 
@@ -179,11 +223,14 @@ class SyncStore:
         digest = token_hash(authorization[7:].strip())
         with self.connect() as db:
             row = db.execute(
-                "SELECT d.id device_id,d.user_id,d.name,u.username FROM devices d JOIN users u ON u.id=d.user_id WHERE d.token_hash=?",
+                "SELECT d.id device_id,d.user_id,d.name,d.last_seen_at,u.username FROM devices d JOIN users u ON u.id=d.user_id WHERE d.token_hash=?",
                 (digest,),
             ).fetchone()
             if not row:
                 raise SyncError(401, "访问令牌无效或已过期")
+            if now_ms() - int(row["last_seen_at"] or 0) > TOKEN_MAX_IDLE_MS:
+                db.execute("UPDATE devices SET token_hash='' WHERE id=?", (row["device_id"],))
+                raise SyncError(401, "登录已过期，请重新登录")
             db.execute("UPDATE devices SET last_seen_at=? WHERE id=?", (now_ms(), row["device_id"]))
             return dict(row)
 
@@ -241,6 +288,10 @@ class SyncStore:
                     "SELECT updated_at,operation FROM entities WHERE user_id=? AND entity_type=? AND entity_id=?",
                     (auth["user_id"], entity_type, entity_id),
                 ).fetchone()
+                if current and current["operation"] == "delete" and operation != "delete" and not payload.get("restoreDeleted"):
+                    conflicts.append({"changeId": change_id, "entityType": entity_type, "entityId": entity_id, "reason": "deleted_on_another_device"})
+                    accepted.append(change_id)
+                    continue
                 if current and (int(current["updated_at"]) > updated or (
                     int(current["updated_at"]) == updated and current["operation"] == "delete" and operation != "delete"
                 )):
@@ -309,6 +360,7 @@ class SyncStore:
 
 
 def make_handler(store: SyncStore):
+    limiter = LoginRateLimiter()
     class SyncHandler(BaseHTTPRequestHandler):
         server_version = "YuejianSync/1.0"
 
@@ -356,7 +408,13 @@ def make_handler(store: SyncStore):
             if self.command == "POST" and path in {"/api/v1/account/register", "/api/v1/account/login"}:
                 data = self._payload()
                 method = store.register if path.endswith("register") else store.login
-                result = method(data.get("username"), data.get("password"), data.get("deviceId"), data.get("deviceName"))
+                rate_key = limiter.check(self.client_address[0] if self.client_address else "", data.get("username"))
+                try:
+                    result = method(data.get("username"), data.get("password"), data.get("deviceId"), data.get("deviceName"))
+                except SyncError:
+                    limiter.failed(rate_key)
+                    raise
+                limiter.succeeded(rate_key)
                 return self._json(200 if path.endswith("login") else 201, result)
             if self.command == "GET" and path == "/api/v1/account/me":
                 auth = self._auth()
@@ -388,6 +446,16 @@ def make_handler(store: SyncStore):
             try:
                 self._dispatch()
             except SyncError as error:
+                if error.status == 429:
+                    self.send_response(429)
+                    body = json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False).encode("utf-8")
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Retry-After", "60")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if self.command != "HEAD": self.wfile.write(body)
+                    return
                 self._json(error.status, {"ok": False, "error": str(error)})
             except Exception:
                 self._json(500, {"ok": False, "error": "服务器内部错误"})
@@ -434,7 +502,16 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=18787, type=int)
     parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--self-test", action="store_true", help="validate the packaged sync service and exit")
     args = parser.parse_args()
+    if args.self_test:
+        with tempfile.TemporaryDirectory(prefix="yuejian-sync-test-") as temporary:
+            probe = SyncStore(Path(temporary))
+            device_id = str(uuid.uuid4())
+            account = probe.register("self.test", "self-test-password", device_id, "Packaged self-test")
+            probe.authenticate("Bearer " + account["accessToken"])
+        print("Yuejian sync server self-test passed")
+        return
     default_root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Yuejian" / "sync-server"
     store = SyncStore(args.data_dir or default_root)
     try:

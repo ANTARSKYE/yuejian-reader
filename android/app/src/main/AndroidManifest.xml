@@ -26,5 +26,9 @@
                 <data android:mimeType="application/epub+zip" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".SyncJobService"
+            android:exported="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>

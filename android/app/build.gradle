@@ -1,5 +1,7 @@
 plugins { id 'com.android.application' }
 
+def releaseVersions = new groovy.json.JsonSlurper().parse(file('../../version.json'))
+
 android {
     namespace 'com.yuejian.reader'
     compileSdk 35
@@ -8,8 +10,8 @@ android {
         applicationId 'com.yuejian.reader'
         minSdk 26
         targetSdk 35
-        versionCode 18
-        versionName '1.2.9'
+        versionCode releaseVersions.androidCode as int
+        versionName releaseVersions.android as String
     }
 
     buildTypes {

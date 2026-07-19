@@ -2802,6 +2802,18 @@ body[data-theme="cat"] .workspace > .panel {
 .translation-result-sheet footer button { border: 1px solid var(--line); border-radius: 12px; padding: 9px 14px; background: var(--soft); color: var(--ink); }
 .translation-result-sheet footer .primary { border-color: transparent; background: var(--accent); color: #102040; font-weight: 750; }
 @keyframes translationPulse { to { opacity: .58; } }
+.library-organizer { display:grid; grid-template-columns:minmax(260px,1fr) 180px auto; gap:10px; margin:14px 0; align-items:end; }
+.library-organizer label span { display:block; margin:0 0 5px; color:var(--muted); font-size:11px; font-weight:700; }
+.library-organizer input,.library-organizer select { box-sizing:border-box; width:100%; min-height:42px; border:1px solid var(--line); border-radius:12px; padding:9px 12px; background:var(--soft); color:var(--ink); }
+.library-search-results { max-height:42vh; overflow:auto; margin-bottom:14px; padding:10px; border:1px solid var(--line); border-radius:16px; background:var(--soft); }
+.library-search-results header { display:flex; justify-content:space-between; align-items:center; padding:4px 5px 10px; }.library-search-results header button { border:0; background:transparent; color:var(--muted); }
+.library-search-hit { display:block; width:100%; border:0; border-top:1px solid var(--line); padding:11px 8px; background:transparent; color:var(--ink); text-align:left; }.library-search-hit b,.library-search-hit span { display:block; }.library-search-hit span { margin-top:5px; color:var(--muted); line-height:1.55; }
+.toc-depth-1 button{padding-left:24px!important}.toc-depth-2 button{padding-left:38px!important;font-size:12px}.toc-depth-3 button,.toc-depth-4 button{padding-left:52px!important;font-size:11px}.toc-depth-5 button,.toc-depth-6 button,.toc-depth-7 button,.toc-depth-8 button{padding-left:66px!important;font-size:11px}
+.book-editor-layer,.reader-link-layer { position:fixed; inset:0; z-index:160; display:grid; place-items:center; padding:22px; background:rgba(3,10,25,.46); }
+.book-editor-layer form,.reader-link-layer>section { width:min(650px,96vw); max-height:90vh; overflow:auto; padding:22px; border:1px solid var(--line); border-radius:24px; background:var(--paper); color:var(--ink); box-shadow:0 30px 90px rgba(0,0,0,.4); }
+.book-editor-layer header,.reader-link-layer header { display:flex; justify-content:space-between; gap:16px; }.book-editor-layer h2,.reader-link-layer h3{margin:3px 0 15px}.book-editor-layer header button,.reader-link-layer header button{width:38px;height:38px;border:0;border-radius:50%;background:var(--soft);color:var(--muted);font-size:23px}
+.book-editor-layer label{display:block;margin:12px 0;color:var(--muted);font-size:12px;font-weight:700}.book-editor-layer input,.book-editor-layer textarea{box-sizing:border-box;width:100%;margin-top:6px;padding:11px 12px;border:1px solid var(--line);border-radius:12px;background:var(--soft);color:var(--ink)}.book-editor-layer textarea{min-height:110px;resize:vertical}.book-editor-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.book-editor-layer footer,.reader-link-layer footer{display:flex;justify-content:flex-end;gap:9px;margin-top:16px}.book-editor-layer footer button,.reader-link-layer footer button,.reader-link-layer footer a{border:1px solid var(--line);border-radius:12px;padding:10px 15px;background:var(--soft);color:var(--ink);text-decoration:none}.book-editor-layer footer .primary{border-color:transparent;background:var(--accent);color:#102040;font-weight:800}.reader-link-content{padding:14px;border-left:4px solid var(--accent);border-radius:4px 13px 13px 4px;background:var(--soft);line-height:1.75;white-space:pre-wrap}
+.reader-history-actions{display:inline-flex;gap:6px}.reader-history-actions button{border:1px solid var(--line);border-radius:10px;padding:7px 10px;background:var(--soft);color:var(--ink)}
 .desktop-annotation-card {
   width: min(680px, calc(100vw - 40px));
   max-height: 82vh;
@@ -2842,6 +2854,7 @@ body[data-theme="cat"] .workspace > .panel {
   background: #8f3e35 !important;
 }
 @media (max-width: 650px) {
+  .library-organizer{grid-template-columns:1fr}.book-editor-row{grid-template-columns:1fr}
   .library-tools {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     align-items: stretch;

@@ -240,6 +240,12 @@
               清理分析缓存
             </button>
           </div>
+          <div class="library-organizer">
+            <label><span>全文搜索</span><input id="librarySearch" type="search" placeholder="搜索全部书籍正文、书名或作者…" /></label>
+            <label><span>书架分类</span><select id="libraryCategory"><option value="">全部分类</option></select></label>
+            <button class="library-tool" id="runLibrarySearch">搜索正文</button>
+          </div>
+          <div class="library-search-results" id="librarySearchResults" hidden></div>
           <div class="library-grid" id="libraryGrid">
             <div class="library-empty">正在整理书架…</div>
           </div>

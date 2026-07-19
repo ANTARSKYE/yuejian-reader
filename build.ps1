@@ -1,4 +1,6 @@
 $ErrorActionPreference = "Stop"
+$VersionInfo = Get-Content -LiteralPath (Join-Path $PSScriptRoot "version.json") -Raw | ConvertFrom-Json
+$DesktopVersion = [string]$VersionInfo.desktop
 Set-Location -LiteralPath $PSScriptRoot
 
 $venv = Join-Path $PSScriptRoot ".venv"
@@ -20,13 +22,14 @@ if (-not (Test-Path -LiteralPath $python)) {
 & $python -m pip install --disable-pip-version-check --upgrade pip
 & $python -m pip install --disable-pip-version-check -r requirements-build.txt
 & $python -m pytest
+if ($LASTEXITCODE -ne 0) { throw "Python tests failed with exit code $LASTEXITCODE." }
 
 & $python -m PyInstaller `
     --noconfirm `
     --clean `
     --onefile `
     --windowed `
-    --name Yuejian-Reader-1.4.8 `
+    --name "Yuejian-Reader-$DesktopVersion" `
     --icon "assets\yuejian.ico" `
     --add-data "index.html;." `
     --add-data "assets;assets" `
@@ -37,9 +40,24 @@ if ($LASTEXITCODE -ne 0) {
     throw "Desktop packaging failed with exit code $LASTEXITCODE. Close any running Yuejian-Reader executable and retry."
 }
 
-$exe = Join-Path $PSScriptRoot "dist\Yuejian-Reader-1.4.8.exe"
+$exe = Join-Path $PSScriptRoot "dist\Yuejian-Reader-$DesktopVersion.exe"
 $process = Start-Process -FilePath $exe -ArgumentList "--self-test" -WindowStyle Hidden -Wait -PassThru
 if ($process.ExitCode -ne 0) {
     throw "Packaged self-test failed with exit code $($process.ExitCode)."
 }
+
+& $python -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onefile `
+    --console `
+    --name "Yuejian-Sync-Server" `
+    sync_server.py
+if ($LASTEXITCODE -ne 0) { throw "Sync server packaging failed with exit code $LASTEXITCODE." }
+$syncExe = Join-Path $PSScriptRoot "dist\Yuejian-Sync-Server.exe"
+$syncTest = Start-Process -FilePath $syncExe -ArgumentList "--self-test" -WindowStyle Hidden -Wait -PassThru
+if ($syncTest.ExitCode -ne 0) { throw "Packaged sync server self-test failed with exit code $($syncTest.ExitCode)." }
+$syncLauncherName = (-join ([char[]](0x9605, 0x89C1, 0x540C, 0x6B65, 0x670D, 0x52A1, 0x5668))) + ".exe"
+Copy-Item -LiteralPath $syncExe -Destination (Join-Path $PSScriptRoot $syncLauncherName) -Force
 Write-Host "Build and self-test completed: $exe" -ForegroundColor Green
+Write-Host "Sync server build completed: $syncExe" -ForegroundColor Green

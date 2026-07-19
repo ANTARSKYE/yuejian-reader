@@ -48,24 +48,26 @@ final class BookRepository extends SQLiteOpenHelper {
         final String path;
         final String fragment;
         final String title;
+        final int depth;
 
-        TocEntry(String path, String fragment, String title) {
+        TocEntry(String path, String fragment, String title, int depth) {
             this.path = path;
             this.fragment = fragment;
             this.title = title;
+            this.depth = Math.max(0, Math.min(8, depth));
         }
     }
 
     BookRepository(Context context) {
-        super(context, "yuejian.db", null, 6);
+        super(context, "yuejian.db", null, 8);
         this.context = context.getApplicationContext();
         this.booksDir = new File(context.getFilesDir(), "books");
         this.booksDir.mkdirs();
     }
 
     @Override public void onCreate(SQLiteDatabase db) {
-        db.execSQL("CREATE TABLE books(id TEXT PRIMARY KEY,title TEXT NOT NULL,type TEXT NOT NULL,author TEXT NOT NULL DEFAULT '',cover_path TEXT NOT NULL DEFAULT '',original_name TEXT NOT NULL DEFAULT '',file_size INTEGER NOT NULL DEFAULT 0,added INTEGER NOT NULL,last_opened INTEGER NOT NULL DEFAULT 0,progress REAL NOT NULL DEFAULT 0,current_chapter INTEGER NOT NULL DEFAULT 0,chapter_count INTEGER NOT NULL DEFAULT 0,updated INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0)");
-        db.execSQL("CREATE TABLE chapters(book_id TEXT NOT NULL,idx INTEGER NOT NULL,title TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(book_id,idx))");
+        db.execSQL("CREATE TABLE books(id TEXT PRIMARY KEY,title TEXT NOT NULL,type TEXT NOT NULL,author TEXT NOT NULL DEFAULT '',cover_path TEXT NOT NULL DEFAULT '',original_name TEXT NOT NULL DEFAULT '',file_size INTEGER NOT NULL DEFAULT 0,added INTEGER NOT NULL,last_opened INTEGER NOT NULL DEFAULT 0,progress REAL NOT NULL DEFAULT 0,current_chapter INTEGER NOT NULL DEFAULT 0,chapter_count INTEGER NOT NULL DEFAULT 0,updated INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0,category TEXT NOT NULL DEFAULT '未分类',tags TEXT NOT NULL DEFAULT '[]',description TEXT NOT NULL DEFAULT '')");
+        db.execSQL("CREATE TABLE chapters(book_id TEXT NOT NULL,idx INTEGER NOT NULL,title TEXT NOT NULL,path TEXT NOT NULL,depth INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(book_id,idx))");
         createFeatureTables(db);
     }
 
@@ -95,6 +97,13 @@ final class BookRepository extends SQLiteOpenHelper {
                 db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES('sync.reading_legacy_migrated','1',?)", new Object[]{System.currentTimeMillis()});
             }
         }
+        if (oldVersion < 7) createPerformanceIndexes(db);
+        if (oldVersion < 8) {
+            db.execSQL("ALTER TABLE books ADD COLUMN category TEXT NOT NULL DEFAULT '未分类'");
+            db.execSQL("ALTER TABLE books ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
+            db.execSQL("ALTER TABLE books ADD COLUMN description TEXT NOT NULL DEFAULT ''");
+            db.execSQL("ALTER TABLE chapters ADD COLUMN depth INTEGER NOT NULL DEFAULT 0");
+        }
     }
 
     private static void createFeatureTables(SQLiteDatabase db) {
@@ -106,6 +115,17 @@ final class BookRepository extends SQLiteOpenHelper {
         db.execSQL("CREATE TABLE IF NOT EXISTS reading_contributions(day TEXT NOT NULL,book_id TEXT NOT NULL,source_id TEXT NOT NULL,seconds INTEGER NOT NULL DEFAULT 0,chars INTEGER NOT NULL DEFAULT 0,completed INTEGER NOT NULL DEFAULT 0,updated INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(day,book_id,source_id))");
         db.execSQL("CREATE TABLE IF NOT EXISTS app_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated INTEGER NOT NULL)");
         db.execSQL("CREATE TABLE IF NOT EXISTS sync_outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,change_id TEXT UNIQUE NOT NULL,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,operation TEXT NOT NULL,payload TEXT NOT NULL,created INTEGER NOT NULL)");
+        createPerformanceIndexes(db);
+    }
+
+    private static void createPerformanceIndexes(SQLiteDatabase db) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS books_visible_recent ON books(deleted,last_opened,added)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS annotations_book_visible ON annotations(book_id,deleted,chapter,created)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS bookmarks_book_visible ON bookmarks(book_id,deleted,chapter,position)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS reading_contributions_book_visible ON reading_contributions(book_id,deleted,day)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS reading_daily_day ON reading_daily(day)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS analysis_chunks_book_updated ON analysis_chunks(book_id,updated)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS sync_outbox_seq ON sync_outbox(seq)");
     }
 
     synchronized JSONObject importBook(Uri uri) throws Exception {
@@ -182,7 +202,7 @@ final class BookRepository extends SQLiteOpenHelper {
                 String html = "<article><h2>" + escape(chapterTitle) + "</h2>" + paragraphs(block) + "</article>";
                 String path = String.format(Locale.ROOT, "chapters/%05d.html", i);
                 writeFile(new File(target, path), html.getBytes(StandardCharsets.UTF_8));
-                insertChapter(db, id, i, chapterTitle, path);
+                insertChapter(db, id, i, chapterTitle, path, 0);
             }
             db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
@@ -264,6 +284,7 @@ final class BookRepository extends SQLiteOpenHelper {
 
         List<String> finalPaths = new ArrayList<>();
         List<String> finalTitles = new ArrayList<>();
+        List<Integer> finalDepths = new ArrayList<>();
         if (tocEntries.isEmpty()) {
             finalPaths.addAll(spinePaths);
         } else {
@@ -272,7 +293,7 @@ final class BookRepository extends SQLiteOpenHelper {
             for (String spinePath : spinePaths) {
                 List<TocEntry> entries = entriesByPath.get(spinePath);
                 if (entries == null || entries.isEmpty()) continue;
-                appendAnchoredSections(target, spinePath, entries, finalPaths, finalTitles);
+                appendAnchoredSections(target, spinePath, entries, finalPaths, finalTitles, finalDepths);
             }
             if (finalPaths.isEmpty()) finalPaths.addAll(spinePaths);
         }
@@ -286,7 +307,7 @@ final class BookRepository extends SQLiteOpenHelper {
                 File chapter = safeFile(target, path);
                 String chapterTitle = i < finalTitles.size() ? finalTitles.get(i) : null;
                 if (chapterTitle == null || chapterTitle.isEmpty()) chapterTitle = extractHtmlTitle(chapter, "第 " + (i + 1) + " 章");
-                insertChapter(db, id, i, chapterTitle, path);
+                insertChapter(db, id, i, chapterTitle, path, i < finalDepths.size() ? finalDepths.get(i) : 0);
             }
             db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
@@ -294,7 +315,7 @@ final class BookRepository extends SQLiteOpenHelper {
 
     synchronized JSONArray listBooks() throws Exception {
         JSONArray result = new JSONArray();
-        try (Cursor c = getReadableDatabase().rawQuery("SELECT id,title,type,author,cover_path,added,last_opened,progress,current_chapter,chapter_count,original_name,file_size,EXISTS(SELECT 1 FROM analysis_cache a WHERE a.book_id=books.id) FROM books WHERE deleted=0 ORDER BY CASE WHEN last_opened=0 THEN added ELSE last_opened END DESC", null)) {
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT id,title,type,author,cover_path,added,last_opened,progress,current_chapter,chapter_count,original_name,file_size,category,tags,description,EXISTS(SELECT 1 FROM analysis_cache a WHERE a.book_id=books.id) FROM books WHERE deleted=0 ORDER BY CASE WHEN last_opened=0 THEN added ELSE last_opened END DESC", null)) {
             while (c.moveToNext()) result.put(bookJson(c));
         }
         return result;
@@ -304,13 +325,13 @@ final class BookRepository extends SQLiteOpenHelper {
         requireBookId(id);
         ensureCurrentEpub(id);
         JSONObject book;
-        try (Cursor c = getReadableDatabase().rawQuery("SELECT id,title,type,author,cover_path,added,last_opened,progress,current_chapter,chapter_count,original_name,file_size,EXISTS(SELECT 1 FROM analysis_cache a WHERE a.book_id=books.id) FROM books WHERE id=? AND deleted=0", new String[]{id})) {
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT id,title,type,author,cover_path,added,last_opened,progress,current_chapter,chapter_count,original_name,file_size,category,tags,description,EXISTS(SELECT 1 FROM analysis_cache a WHERE a.book_id=books.id) FROM books WHERE id=? AND deleted=0", new String[]{id})) {
             if (!c.moveToFirst()) throw new IllegalArgumentException("书籍不存在");
             book = bookJson(c);
         }
         JSONArray chapters = new JSONArray();
-        try (Cursor c = getReadableDatabase().rawQuery("SELECT idx,title,path FROM chapters WHERE book_id=? ORDER BY idx", new String[]{id})) {
-            while (c.moveToNext()) chapters.put(new JSONObject().put("index", c.getInt(0)).put("title", c.getString(1)).put("path", c.getString(2)));
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT idx,title,path,depth FROM chapters WHERE book_id=? ORDER BY idx", new String[]{id})) {
+            while (c.moveToNext()) chapters.put(new JSONObject().put("index", c.getInt(0)).put("title", c.getString(1)).put("path", c.getString(2)).put("depth", c.getInt(3)));
         }
         if (chapters.length() == 0) throw new IllegalStateException("书籍原文尚未同步，请在电脑服务器开启后点击立即同步");
         book.put("chapters", chapters);
@@ -374,6 +395,40 @@ final class BookRepository extends SQLiteOpenHelper {
         String base = "https://app.local/content/" + bookId + "/" + parentPath(path);
         return new JSONObject().put("title", title).put("html", html).put("base", base);
     }
+
+    synchronized JSONArray searchBooks(String query, String onlyBookId, int limit) throws Exception {
+        String needle = query == null ? "" : query.trim().toLowerCase(Locale.ROOT);
+        if (needle.isEmpty() || needle.length() > 100) throw new IllegalArgumentException("请输入 1–100 个字符进行搜索");
+        JSONArray result = new JSONArray(); int maximum = Math.max(1, Math.min(100, limit));
+        String sql = "SELECT c.book_id,b.title,c.idx,c.title,c.path FROM chapters c JOIN books b ON b.id=c.book_id WHERE b.deleted=0" + (onlyBookId == null || onlyBookId.isEmpty() ? "" : " AND c.book_id=?") + " ORDER BY b.last_opened DESC,c.idx";
+        String[] args = onlyBookId == null || onlyBookId.isEmpty() ? null : new String[]{onlyBookId};
+        try (Cursor c = getReadableDatabase().rawQuery(sql, args)) {
+            while (c.moveToNext() && result.length() < maximum) {
+                File file = safeFile(new File(booksDir, c.getString(0)), c.getString(4));
+                String text = decodeText(readAll(new FileInputStream(file))).replaceAll("(?is)<script.*?</script>|<style.*?</style>|<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+                String folded = text.toLowerCase(Locale.ROOT); int from = 0, found;
+                while (result.length() < maximum && (found = folded.indexOf(needle, from)) >= 0) {
+                    int left = Math.max(0, found - 42), right = Math.min(text.length(), found + query.length() + 68);
+                    result.put(new JSONObject().put("bookId", c.getString(0)).put("bookTitle", c.getString(1)).put("chapter", c.getInt(2)).put("chapterTitle", c.getString(3)).put("snippet", (left > 0 ? "…" : "") + text.substring(left, right) + (right < text.length() ? "…" : "")));
+                    from = found + Math.max(1, needle.length());
+                }
+            }
+        }
+        return result;
+    }
+
+    synchronized JSONObject updateBookMetadata(String id, String json) throws Exception {
+        requireBookId(id); JSONObject input = new JSONObject(json); long now = System.currentTimeMillis();
+        String title = compact(input.optString("title"), 160), author = compact(input.optString("author"), 120), category = compact(input.optString("category", "未分类"), 40), description = compact(input.optString("description"), 1000);
+        if (title.isEmpty()) throw new IllegalArgumentException("书名不能为空"); if (category.isEmpty()) category = "未分类";
+        JSONArray raw = input.optJSONArray("tags"); JSONArray tags = new JSONArray(); java.util.HashSet<String> seen = new java.util.HashSet<>();
+        if (raw != null) for (int i = 0; i < raw.length() && tags.length() < 12; i++) { String tag = compact(raw.optString(i), 24); if (!tag.isEmpty() && seen.add(tag)) tags.put(tag); }
+        SQLiteDatabase db = getWritableDatabase(); db.execSQL("UPDATE books SET title=?,author=?,category=?,tags=?,description=?,updated=? WHERE id=? AND deleted=0", new Object[]{title,author,category,tags.toString(),description,now,id});
+        JSONObject payload = new JSONObject().put("id",id).put("bookId",id).put("title",title).put("author",author).put("category",category).put("tags",tags).put("description",description).put("updatedAt",now);
+        recordChange(db, "book_meta", id, "upsert", payload.toString(), now); return getBook(id);
+    }
+
+    private static String compact(String value, int maximum) { String clean = value == null ? "" : value.replaceAll("\\s+", " ").trim(); return clean.length() > maximum ? clean.substring(0, maximum) : clean; }
 
     synchronized void updateProgress(String id, int chapter, double progress) {
         requireBookId(id);
@@ -504,6 +559,14 @@ final class BookRepository extends SQLiteOpenHelper {
         db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES(?,?,?)", new Object[]{key, value, now});
         try { recordChange(db, "app_state", key, "upsert", new JSONObject().put("key", key).put("value", value).put("updatedAt", now).toString(), now); }
         catch (Exception ignored) {}
+    }
+
+    synchronized void saveTranslationCache(String key, String value) {
+        if (key == null || !key.matches("tr-v1-[a-f0-9]{64}") || value == null || value.length() > 100_000)
+            throw new IllegalArgumentException("翻译缓存内容无效");
+        SQLiteDatabase db = getWritableDatabase();
+        db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES(?,?,?)", new Object[]{key, value, System.currentTimeMillis()});
+        db.execSQL("DELETE FROM app_state WHERE key IN (SELECT key FROM app_state WHERE key LIKE 'tr-v1-%' ORDER BY updated DESC LIMIT -1 OFFSET 500)");
     }
 
     synchronized void recordReading(String bookId, long seconds, long chars, int completed) {
@@ -753,8 +816,8 @@ final class BookRepository extends SQLiteOpenHelper {
             long local = rowLong(db, "SELECT updated FROM books WHERE id=?", id); if (updated < local) return;
             db.execSQL("INSERT OR IGNORE INTO books(id,title,type,author,cover_path,original_name,file_size,added,last_opened,progress,current_chapter,chapter_count,updated,deleted) VALUES(?,?,?,?,?,?,?, ?,0,0,0,?,?,0)",
                     new Object[]{id, payload.optString("title", "未下载书籍"), payload.optString("type", "epub"), payload.optString("author"), "", payload.optString("originalName"), payload.optLong("fileSize"), payload.optLong("addedAt", updated), payload.optInt("chapterCount"), updated});
-            db.execSQL("UPDATE books SET title=?,author=?,original_name=?,file_size=?,chapter_count=MAX(chapter_count,?),updated=?,deleted=0 WHERE id=?",
-                    new Object[]{payload.optString("title", "未下载书籍"), payload.optString("author"), payload.optString("originalName"), payload.optLong("fileSize"), payload.optInt("chapterCount"), updated, id});
+            db.execSQL("UPDATE books SET title=?,author=?,category=?,tags=?,description=?,original_name=CASE WHEN ?='' THEN original_name ELSE ? END,file_size=MAX(file_size,?),chapter_count=MAX(chapter_count,?),updated=?,deleted=0 WHERE id=?",
+                    new Object[]{payload.optString("title", "未下载书籍"), payload.optString("author"), payload.optString("category", "未分类"), String.valueOf(payload.optJSONArray("tags") == null ? new JSONArray() : payload.optJSONArray("tags")), payload.optString("description"), payload.optString("originalName"), payload.optString("originalName"), payload.optLong("fileSize"), payload.optInt("chapterCount"), updated, id});
             return;
         }
         if ("app_state".equals(type)) applyRemoteState(db, payload.optString("key", id), payload.optString("value", ""), operation, updated);
@@ -881,21 +944,26 @@ final class BookRepository extends SQLiteOpenHelper {
                 .put("author", c.getString(3)).put("coverUrl", cover.isEmpty() ? "" : "https://app.local/content/" + id + "/" + cover)
                 .put("added", c.getLong(5)).put("lastOpened", c.getLong(6)).put("progress", c.getDouble(7))
                 .put("currentChapter", c.getInt(8)).put("chapterCount", c.getInt(9)).put("originalName", c.getString(10)).put("fileSize", c.getLong(11))
-                .put("available", original.isFile()).put("analyzed", c.getInt(12) != 0);
+                .put("category", c.getString(12)).put("tags", new JSONArray(c.getString(13))).put("description", c.getString(14))
+                .put("available", original.isFile()).put("analyzed", c.getInt(15) != 0);
     }
 
     private static void upsertBook(SQLiteDatabase db, String id, String title, String type, String author, String coverPath, String originalName, long fileSize, int count) {
         long now = System.currentTimeMillis();
-        db.execSQL("INSERT OR REPLACE INTO books(id,title,type,author,cover_path,original_name,file_size,added,last_opened,progress,current_chapter,chapter_count,updated,deleted) VALUES(?,?,?,?,?,?,?,?,0,0,0,?,?,0)", new Object[]{id, title, type, author, coverPath, originalName, fileSize, now, count, now});
+        boolean restoring = rowLong(db, "SELECT deleted FROM books WHERE id=?", id) == 1;
+        String category="未分类", tags="[]", description="";
+        try (Cursor c=db.rawQuery("SELECT category,tags,description,title,author FROM books WHERE id=?",new String[]{id})) { if(c.moveToFirst()){category=c.getString(0);tags=c.getString(1);description=c.getString(2);if(!c.getString(3).isEmpty())title=c.getString(3);if(!c.getString(4).isEmpty())author=c.getString(4);} }
+        db.execSQL("INSERT OR REPLACE INTO books(id,title,type,author,cover_path,original_name,file_size,added,last_opened,progress,current_chapter,chapter_count,updated,deleted,category,tags,description) VALUES(?,?,?,?,?,?,?,?,0,0,0,?,?,0,?,?,?)", new Object[]{id, title, type, author, coverPath, originalName, fileSize, now, count, now, category, tags, description});
         try {
             JSONObject payload = new JSONObject().put("id", id).put("bookId", id).put("title", title).put("type", type).put("author", author)
-                    .put("chapterCount", count).put("originalName", originalName).put("fileSize", fileSize).put("blobSha256", id).put("updatedAt", now);
+                    .put("category",category).put("tags",new JSONArray(tags)).put("description",description).put("chapterCount", count).put("originalName", originalName).put("fileSize", fileSize).put("blobSha256", id).put("updatedAt", now);
+            if (restoring) payload.put("restoreDeleted", true);
             recordChange(db, "book", id, "upsert", payload.toString(), now);
         } catch (Exception ignored) {}
     }
 
-    private static void insertChapter(SQLiteDatabase db, String id, int index, String title, String path) {
-        db.execSQL("INSERT INTO chapters(book_id,idx,title,path) VALUES(?,?,?,?)", new Object[]{id, index, title, path});
+    private static void insertChapter(SQLiteDatabase db, String id, int index, String title, String path, int depth) {
+        db.execSQL("INSERT INTO chapters(book_id,idx,title,path,depth) VALUES(?,?,?,?,?)", new Object[]{id, index, title, path, Math.max(0, Math.min(8, depth))});
     }
 
     private String queryName(Uri uri) {
@@ -990,7 +1058,7 @@ final class BookRepository extends SQLiteOpenHelper {
         return output;
     }
 
-    private static void appendAnchoredSections(File root, String path, List<TocEntry> entries, List<String> outputPaths, List<String> outputTitles) throws Exception {
+    private static void appendAnchoredSections(File root, String path, List<TocEntry> entries, List<String> outputPaths, List<String> outputTitles, List<Integer> outputDepths) throws Exception {
         String html = sanitizeHtml(decodeText(readAll(new FileInputStream(safeFile(root, path)))));
         Matcher body = Pattern.compile("(?is)<body[^>]*>(.*?)</body>").matcher(html);
         String content = body.find() ? body.group(1) : html;
@@ -999,15 +1067,18 @@ final class BookRepository extends SQLiteOpenHelper {
 
         List<Integer> starts = new ArrayList<>();
         List<String> titles = new ArrayList<>();
+        List<Integer> depths = new ArrayList<>();
         for (TocEntry entry : entries) {
             int start = entry.fragment.isEmpty() ? 0 : anchorStart(content, entry.fragment);
             if (start < 0 || (!starts.isEmpty() && start <= starts.get(starts.size() - 1))) continue;
             starts.add(start);
             titles.add(entry.title);
+            depths.add(entry.depth);
         }
         if (starts.isEmpty()) {
             starts.add(0);
             titles.add(entries.get(0).title);
+            depths.add(entries.get(0).depth);
         }
         for (int i = 0; i < starts.size(); i++) {
             int end = i + 1 < starts.size() ? starts.get(i + 1) : content.length();
@@ -1018,6 +1089,7 @@ final class BookRepository extends SQLiteOpenHelper {
             writeFile(new File(root, output), wrapped.getBytes(StandardCharsets.UTF_8));
             outputPaths.add(output);
             outputTitles.add(titles.get(i));
+            outputDepths.add(depths.get(i));
         }
     }
 
@@ -1072,22 +1144,22 @@ final class BookRepository extends SQLiteOpenHelper {
     private static void collectNavEntries(File root, String navPath, List<TocEntry> entries) {
         try {
             Document document = parseXml(safeFile(root, navPath)); NodeList links = document.getElementsByTagNameNS("*", "a");
-            for (int i = 0; i < links.getLength(); i++) { Element link = (Element) links.item(i); String href = link.getAttribute("href"), text = link.getTextContent().replaceAll("\\s+", " ").trim(); if (!href.isEmpty() && !text.isEmpty()) entries.add(tocEntry(parentPath(navPath), href, text)); }
+            for (int i = 0; i < links.getLength(); i++) { Element link = (Element) links.item(i); String href = link.getAttribute("href"), text = link.getTextContent().replaceAll("\\s+", " ").trim(); int depth=0; org.w3c.dom.Node p=link.getParentNode(); while(p!=null){if(p instanceof Element && "li".equalsIgnoreCase(((Element)p).getLocalName()))depth++;p=p.getParentNode();} if (!href.isEmpty() && !text.isEmpty()) entries.add(tocEntry(parentPath(navPath), href, text, Math.max(0,depth-1))); }
         } catch (Exception ignored) {}
     }
 
     private static void collectNcxEntries(File root, String ncxPath, List<TocEntry> entries) {
         try {
             Document document = parseXml(safeFile(root, ncxPath)); NodeList points = document.getElementsByTagNameNS("*", "navPoint");
-            for (int i = 0; i < points.getLength(); i++) { Element point = (Element) points.item(i); NodeList content = point.getElementsByTagNameNS("*", "content"), labels = point.getElementsByTagNameNS("*", "text"); if (content.getLength() > 0 && labels.getLength() > 0) { String src = ((Element) content.item(0)).getAttribute("src"), text = labels.item(0).getTextContent().replaceAll("\\s+", " ").trim(); if (!src.isEmpty() && !text.isEmpty()) entries.add(tocEntry(parentPath(ncxPath), src, text)); } }
+            for (int i = 0; i < points.getLength(); i++) { Element point = (Element) points.item(i); NodeList content = point.getElementsByTagNameNS("*", "content"), labels = point.getElementsByTagNameNS("*", "text"); int depth=0; org.w3c.dom.Node p=point.getParentNode(); while(p!=null){if(p instanceof Element && "navPoint".equalsIgnoreCase(((Element)p).getLocalName()))depth++;p=p.getParentNode();} if (content.getLength() > 0 && labels.getLength() > 0) { String src = ((Element) content.item(0)).getAttribute("src"), text = labels.item(0).getTextContent().replaceAll("\\s+", " ").trim(); if (!src.isEmpty() && !text.isEmpty()) entries.add(tocEntry(parentPath(ncxPath), src, text, depth)); } }
         } catch (Exception ignored) {}
     }
 
-    private static TocEntry tocEntry(String base, String reference, String title) throws Exception {
+    private static TocEntry tocEntry(String base, String reference, String title, int depth) throws Exception {
         String[] parts = reference.split("#", 2);
         String path = resolvePath(base, parts[0]);
         String fragment = parts.length > 1 ? URLDecoder.decode(parts[1], "UTF-8") : "";
-        return new TocEntry(path, fragment, title);
+        return new TocEntry(path, fragment, title, depth);
     }
 
     private static String firstTagText(Document doc, String name, String fallback) {

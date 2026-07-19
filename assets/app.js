@@ -4,7 +4,7 @@ import { initializePersistentStorage, refreshPersistentStorage } from "./ui-stor
 const launchParameters = new URLSearchParams(location.search);
 if (launchParameters.has("desktop")) {
   document.body.classList.add("desktop");
-  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.4.8";
+  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.5.0";
 }
 if (launchParameters.has("token"))
   history.replaceState(
@@ -33,6 +33,31 @@ let sessionId = "",
   readingActive = false,
   readingTimer = null,
   activeQaTopicId = "";
+let positionNavigation = false;
+function positionKey() { return "yj-pos-" + String(currentBookKey || "").slice(0, 64); }
+function positionState() {
+  try { return JSON.parse(localStorage.getItem(positionKey()) || '{"items":[],"cursor":-1}'); }
+  catch { return { items: [], cursor: -1 }; }
+}
+function captureReadingPosition(reason = "跳转") {
+  if (!currentBookKey || !currentBookData || positionNavigation) return;
+  const state = positionState(), item = { chapter: currentChapterIndex, page: desktopPageIndex || 0,
+    scroll: Math.max(0, window.scrollY || 0), title: desktopChapterTitle(currentChapterIndex), reason, at: Date.now() };
+  const previous = state.items[state.cursor];
+  if (previous && previous.chapter === item.chapter && Math.abs((previous.scroll || 0) - item.scroll) < 80) return;
+  state.items = state.items.slice(0, state.cursor + 1);
+  state.items.push(item); state.items = state.items.slice(-60); state.cursor = state.items.length - 1;
+  localStorage.setItem(positionKey(), JSON.stringify(state));
+}
+async function navigatePosition(direction) {
+  const state = positionState(), next = state.cursor + direction;
+  if (next < 0 || next >= state.items.length) return showNotice("没有更早或更晚的阅读位置。", true);
+  state.cursor = next; localStorage.setItem(positionKey(), JSON.stringify(state));
+  const item = state.items[next]; positionNavigation = true;
+  await loadChapter(item.chapter);
+  requestAnimationFrame(() => { if (desktopReaderFlow === "page") { desktopPageIndex = item.page || 0; updateDesktopPage(false); }
+    else window.scrollTo({ top: item.scroll || 0, behavior: "smooth" }); positionNavigation = false; });
+}
 const escapeHtml = (value) =>
   String(value ?? "").replace(
     /[&<>'"]/g,
@@ -1412,6 +1437,7 @@ async function turnDesktopPage(direction) {
   updateDesktopPage();
 }
 async function loadChapter(index) {
+  if (currentBookData && index !== currentChapterIndex) captureReadingPosition("章节跳转");
   currentChapterIndex = index;
   saveCurrentBookProgress();
   readingActive = true;
@@ -1438,7 +1464,7 @@ async function loadChapter(index) {
       (data.index + 1) +
       " / " +
       data.total +
-      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><button id="copySelection">复制</button><button id="shareSelection">分享书签</button><button id="selectParagraph">段落全选</button><button id="translateSelection">快速翻译</button><button id="aiTranslateSelection">AI 翻译</button><i class="tool-divider"></i><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
+      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><span class="reader-history-actions"><button id="readerHistoryBack" title="返回上一个阅读位置">↶ 位置</button><button id="readerHistoryForward" title="前往下一个阅读位置">位置 ↷</button></span><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><button id="copySelection">复制</button><button id="shareSelection">分享书签</button><button id="selectParagraph">段落全选</button><button id="translateSelection">快速翻译</button><button id="aiTranslateSelection">AI 翻译</button><i class="tool-divider"></i><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
       data.html +
       '</div><div class="reader-nav"><button id="prevChapter" ' +
       (data.index === 0 ? "disabled" : "") +
@@ -1446,6 +1472,9 @@ async function loadChapter(index) {
       (data.index === data.total - 1 ? "disabled" : "") +
       ">下一章 →</button></div>";
     initReaderTools();
+    document.getElementById("readerHistoryBack").onclick = () => navigatePosition(-1);
+    document.getElementById("readerHistoryForward").onclick = () => navigatePosition(1);
+    installReaderLinkLayers();
     document.getElementById("chapterComplete").onclick = toggleChapterComplete;
     updateCompleteButton();
     document.getElementById("prevChapter").onclick = () =>
@@ -1465,6 +1494,19 @@ async function loadChapter(index) {
     document.getElementById("viewContent").innerHTML =
       '<div class="reader-loading">' + escapeHtml(error.message) + "</div>";
   }
+}
+function installReaderLinkLayers() {
+  document.querySelectorAll(".reader-body a[href]").forEach((link) => link.addEventListener("click", (event) => {
+    event.preventDefault();
+    const href = link.getAttribute("href") || "", anchor = href.startsWith("#") ? document.getElementById(href.slice(1)) : null;
+    const title = anchor ? "脚注" : "链接";
+    const content = anchor ? (anchor.textContent || "该脚注没有可显示的文字。") : href;
+    const layer = document.createElement("div"); layer.className = "reader-link-layer";
+    layer.innerHTML = '<section><header><div><small>' + title + '</small><h3>' + escapeHtml(anchor ? (link.textContent || "查看注释") : "即将打开外部网页") + '</h3></div><button aria-label="关闭">×</button></header><div class="reader-link-content">' + escapeHtml(content.trim()) + '</div><footer>' + (!anchor ? '<a target="_blank" rel="noopener noreferrer" href="' + escapeHtml(href) + '">确认打开</a>' : '') + '<button>返回阅读</button></footer></section>';
+    document.body.append(layer); requestAnimationFrame(() => layer.classList.add("open"));
+    const close = () => layer.remove(); layer.querySelector("header button").onclick = close; layer.querySelector("footer button").onclick = close;
+    layer.onclick = (e) => { if (e.target === layer) close(); };
+  }));
 }
 const arrayOf = (value) => (Array.isArray(value) ? value : []);
 function chapterChips(chapters) {
@@ -1765,15 +1807,16 @@ function render(data) {
   currentChapterIndex = Math.max(0, Math.min(data.chapters.length - 1, Number(savedProgress?.chapter) || 0));
   migrateLegacyBookData(data.title, currentBookKey);
   rememberReadingMeta(data);
+  const chapterItems = Array.isArray(data.chapter_items) ? data.chapter_items : data.chapters.map(title => ({ title, depth: 0 }));
   document.querySelector(".chapters").innerHTML =
     '<li><button class="active" data-analysis>AI 分析</button></li>' +
-    data.chapters
+    chapterItems
       .map(
         (chapter, i) =>
-          '<li><button data-index="' +
+          '<li class="toc-depth-' + Math.min(8, Number(chapter.depth) || 0) + '"><button data-index="' +
           i +
           '">' +
-          escapeHtml(chapter) +
+          escapeHtml(chapter.title) +
           "</button></li>",
       )
       .join("");
@@ -2349,6 +2392,7 @@ backgroundInput.addEventListener("change", () => {
 });
 const bookshelfModal = document.getElementById("bookshelfModal"),
   libraryGrid = document.getElementById("libraryGrid");
+let desktopLibraryBooks = [];
 function formatFileSize(bytes) {
   return bytes > 1048576
     ? (bytes / 1048576).toFixed(1) + " MB"
@@ -2368,8 +2412,23 @@ async function refreshLibrary() {
     const response = await fetch("/api/library", { cache: "no-store" }),
       data = await response.json();
     if (!response.ok) throw new Error(data.error || "书架读取失败");
-    libraryGrid.innerHTML = data.books.length
-      ? data.books
+    desktopLibraryBooks = data.books || [];
+    const categories = [...new Set(desktopLibraryBooks.map(book => book.category || "未分类"))].sort();
+    const categorySelect = document.getElementById("libraryCategory"), selected = categorySelect.value;
+    categorySelect.innerHTML = '<option value="">全部分类</option>' + categories.map(x => '<option>' + escapeHtml(x) + '</option>').join('');
+    categorySelect.value = categories.includes(selected) ? selected : "";
+    renderDesktopLibrary();
+    await refreshStorageStatus();
+  } catch (error) {
+    libraryGrid.innerHTML =
+      '<div class="library-empty">' + escapeHtml(error.message) + "</div>";
+  }
+}
+function renderDesktopLibrary() {
+    const term = document.getElementById("librarySearch").value.trim().toLocaleLowerCase(), category = document.getElementById("libraryCategory").value;
+    const books = desktopLibraryBooks.filter(book => (!category || (book.category || "未分类") === category) && (!term || [book.title, book.author, book.category, ...(book.tags || [])].join(" ").toLocaleLowerCase().includes(term)));
+    libraryGrid.innerHTML = books.length
+      ? books
           .map((book) => {
             const cover = book.has_cover
               ? '<img class="library-cover" src="' +
@@ -2387,7 +2446,7 @@ async function refreshLibrary() {
               escapeHtml(book.title) +
               '">' +
               escapeHtml(book.title) +
-              "</b><span>" +
+              "</b><span>" + escapeHtml(book.author || "作者未标注") + " · " + escapeHtml(book.category || "未分类") + "</span><span>" +
               escapeHtml(book.original_name.split(".").pop().toUpperCase()) +
               " · " +
               formatFileSize(book.file_size) +
@@ -2397,7 +2456,7 @@ async function refreshLibrary() {
               formatLibraryDate(book.last_opened) +
               '</span></div><div class="library-actions"><button class="library-open" data-book-hash="' +
               book.book_hash +
-              '">继续阅读</button><button class="library-delete" data-book-hash="' +
+              '">继续阅读</button><button class="library-edit" data-book-hash="' + book.book_hash + '">编辑资料</button><button class="library-delete" data-book-hash="' +
               book.book_hash +
               '" data-book-title="' +
               escapeHtml(book.title) +
@@ -2405,7 +2464,7 @@ async function refreshLibrary() {
             );
           })
           .join("")
-      : '<div class="library-empty">书架还是空的。上传第一本 EPUB 或 TXT 后，它会自动出现在这里。</div>';
+      : '<div class="library-empty">没有符合当前筛选条件的书籍。</div>';
     document
       .querySelectorAll(".library-open")
       .forEach(
@@ -2416,11 +2475,25 @@ async function refreshLibrary() {
       button.onclick = () =>
         deleteLibraryBook(button.dataset.bookHash, button.dataset.bookTitle);
     });
-    await refreshStorageStatus();
-  } catch (error) {
-    libraryGrid.innerHTML =
-      '<div class="library-empty">' + escapeHtml(error.message) + "</div>";
-  }
+    document.querySelectorAll(".library-edit").forEach(button => button.onclick = () => editDesktopBook(button.dataset.bookHash));
+}
+function editDesktopBook(bookHash) {
+  const book = desktopLibraryBooks.find(item => item.book_hash === bookHash); if (!book) return;
+  const layer = document.createElement("div"); layer.className = "book-editor-layer open";
+  layer.innerHTML = '<form><header><div><small>书籍信息</small><h2>整理《' + escapeHtml(book.title) + '》</h2></div><button type="button" aria-label="关闭">×</button></header><label>书名<input name="title" maxlength="160" value="' + escapeHtml(book.title) + '"></label><label>作者<input name="author" maxlength="120" value="' + escapeHtml(book.author || "") + '"></label><div class="book-editor-row"><label>分类<input name="category" maxlength="40" value="' + escapeHtml(book.category || "未分类") + '"></label><label>标签（逗号分隔）<input name="tags" maxlength="300" value="' + escapeHtml((book.tags || []).join(", ")) + '"></label></div><label>简介<textarea name="description" maxlength="1000">' + escapeHtml(book.description || "") + '</textarea></label><footer><button type="button">取消</button><button class="primary" type="submit">保存资料</button></footer></form>';
+  document.body.append(layer); const close = () => layer.remove(); layer.querySelector("header button").onclick = close; layer.querySelector("footer button").onclick = close;
+  layer.onsubmit = async e => { e.preventDefault(); const values = Object.fromEntries(new FormData(e.target)); values.book_hash = bookHash; values.tags = values.tags.split(/[,，]/).map(x => x.trim()).filter(Boolean);
+    try { const response = await fetch("/api/library/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "保存失败"); close(); showNotice("书籍资料已保存并加入同步队列。"); await refreshLibrary(); }
+    catch (error) { showNotice(error.message, true); } };
+}
+async function runDesktopFullTextSearch() {
+  const input = document.getElementById("librarySearch"), box = document.getElementById("librarySearchResults"), q = input.value.trim();
+  if (!q) return showNotice("请输入要查找的文字。", true);
+  box.hidden = false; box.innerHTML = '<div class="library-empty">正在检索全部书籍正文…</div>';
+  try { const response = await fetch("/api/library/search?q=" + encodeURIComponent(q)); const data = await response.json(); if (!response.ok) throw new Error(data.error || "搜索失败");
+    box.innerHTML = data.results.length ? '<header><b>找到 ' + data.results.length + ' 处内容</b><button>收起</button></header>' + data.results.map((item, i) => '<button class="library-search-hit" data-i="' + i + '"><b>' + escapeHtml(item.book_title) + ' · ' + escapeHtml(item.chapter_title) + '</b><span>' + escapeHtml(item.snippet) + '</span></button>').join('') : '<div class="library-empty">没有找到相关正文。</div>';
+    box.querySelector("header button")?.addEventListener("click", () => box.hidden = true); box.querySelectorAll(".library-search-hit").forEach(button => button.onclick = () => { const hit = data.results[Number(button.dataset.i)]; openLibraryBook(hit.book_hash, hit.chapter); });
+  } catch (error) { box.innerHTML = '<div class="library-empty">' + escapeHtml(error.message) + '</div>'; }
 }
 async function refreshStorageStatus() {
   try {
@@ -2449,7 +2522,7 @@ async function deleteLibraryBook(bookHash, bookTitle) {
     showNotice(error.message, true);
   }
 }
-async function openLibraryBook(bookHash) {
+async function openLibraryBook(bookHash, targetChapter = null) {
   bookshelfModal.classList.remove("open");
   status.textContent = "正在从书架打开…";
   setProgress(8, "正在打开本地书籍…", "恢复章节、分析结果与阅读记录", "请稍候");
@@ -2462,6 +2535,7 @@ async function openLibraryBook(bookHash) {
       prepared = await response.json();
     if (!response.ok) throw new Error(prepared.error || "书籍打开失败");
     await continuePrepared(prepared);
+    if (targetChapter !== null) await loadChapter(Math.max(0, Math.min(prepared.chapters.length - 1, Number(targetChapter) || 0)));
   } catch (error) {
     clearInterval(progressTimer);
     showNotice(error.message, true);
@@ -2472,6 +2546,10 @@ document.getElementById("bookshelfButton").onclick = () => {
   openExclusiveModal(bookshelfModal);
   refreshLibrary();
 };
+document.getElementById("librarySearch").addEventListener("input", renderDesktopLibrary);
+document.getElementById("librarySearch").addEventListener("keydown", e => { if (e.key === "Enter") runDesktopFullTextSearch(); });
+document.getElementById("libraryCategory").addEventListener("change", renderDesktopLibrary);
+document.getElementById("runLibrarySearch").onclick = runDesktopFullTextSearch;
 document.getElementById("closeBookshelf").onclick = () =>
   bookshelfModal.classList.remove("open");
 bookshelfModal.addEventListener("click", (e) => {

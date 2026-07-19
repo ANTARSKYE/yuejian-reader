@@ -4,6 +4,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.util.Locale;
 
 final class SyncManager {
     interface Progress { void update(JSONObject value); }
@@ -23,7 +24,7 @@ final class SyncManager {
         if (password == null || password.length() < 8 || password.length() > 200) throw new IllegalArgumentException("密码长度需为 8–200 位");
         String cleanUrl = serverUrl == null || serverUrl.trim().isEmpty() || "auto".equalsIgnoreCase(serverUrl.trim())
                 ? HttpSyncTransport.discoverServer() : HttpSyncTransport.validateServerUrl(serverUrl);
-        String cleanUser = username == null ? "" : username.trim().toLowerCase();
+        String cleanUser = username == null ? "" : username.trim().toLowerCase(Locale.ROOT);
         String cleanDevice = deviceName == null || deviceName.trim().isEmpty() ? "Android device" : deviceName.trim().substring(0, Math.min(80, deviceName.trim().length()));
         JSONObject request = new JSONObject().put("username", cleanUser).put("password", password)
                 .put("deviceId", account.deviceId()).put("deviceName", cleanDevice);
@@ -145,10 +146,10 @@ final class SyncManager {
         return cursor;
     }
 
-    private static String message(Exception error) {
+    static String friendlyMessage(Exception error) {
         String value = error.getMessage();
         if (value == null || value.trim().isEmpty()) return "同步服务器未开启或当前网络不可达";
-        String lowered = value.toLowerCase();
+        String lowered = value.toLowerCase(Locale.ROOT);
         if (lowered.contains("failed to connect") || lowered.contains("connection refused") || lowered.contains("connect timed out") || lowered.contains("timeout"))
             return "无法连接电脑同步服务器。请确认服务器窗口保持打开，手机和电脑连接同一普通 Wi-Fi，并关闭手机 VPN、网络加速、移动数据切换及访客网络。";
         if (lowered.contains("network is unreachable") || lowered.contains("no route to host"))
@@ -156,9 +157,11 @@ final class SyncManager {
         return value;
     }
 
+    private static String message(Exception error) { return friendlyMessage(error); }
+
     private static boolean connectionFailure(Exception error) {
         String value = error.getMessage(); if (value == null) return error instanceof java.io.IOException;
-        String lowered = value.toLowerCase();
+        String lowered = value.toLowerCase(Locale.ROOT);
         return error instanceof java.io.IOException || lowered.contains("failed to connect") || lowered.contains("connection") || lowered.contains("timeout") || lowered.contains("unreachable");
     }
 }

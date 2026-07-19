@@ -40,7 +40,7 @@
   const originalInit = F.init.bind(F);
   F.init = function () {
     originalInit();
-    A.showAbout = () => A.toast('阅见 Android 1.2.9 · 阅读页内翻译');
+    A.showAbout = () => A.toast('阅见 Android 1.3.0 · 阅读页内翻译');
     this.installReadingExperience();
     this.installAnnotationUi();
     this.installNavigationFeedback();
@@ -184,10 +184,14 @@
     setting.innerHTML = '<label><span>翻阅方式</span><span id="readingFlowLabel">连续滑动</span></label><div class="reading-flow-switch"><button data-flow="scroll">连续滑动</button><button data-flow="page">左右翻页</button></div>';
     document.querySelector('#settingsSheet .sheet').insertBefore(setting, document.querySelector('#settingsSheet .setting:last-of-type'));
     document.querySelectorAll('[data-flow]').forEach(button => button.onclick = () => this.setReadingFlow(button.dataset.flow));
+    document.querySelector('.reader-foot').insertAdjacentHTML('afterbegin','<button class="position-history" id="positionBack" title="上一个阅读位置">↶</button><button class="position-history" id="positionForward" title="下一个阅读位置">↷</button>');
+    document.getElementById('positionBack').onclick=()=>this.navigatePosition(-1);document.getElementById('positionForward').onclick=()=>this.navigatePosition(1);
+    A.renderToc=()=>{document.getElementById('toc').innerHTML=A.book.chapters.map((c,i)=>`<button data-i="${i}" style="padding-left:${22+Math.min(8,+c.depth||0)*16}px" onclick="app.jump(${i})">${esc(c.title)}</button>`).join('')};
     this.readingFlow = readState('readingFlow', 'scroll');
     this.setReadingFlow(this.readingFlow, false);
     const oldLoad = A.loadChapter.bind(A);
     A.loadChapter = async (index, savePrevious = true) => {
+      if(savePrevious && A.book && index!==A.chapter && !this.positionNavigating)this.capturePosition('章节跳转');
       this.continuousLoading = false;
       await oldLoad(index, savePrevious);
     };
@@ -196,6 +200,10 @@
     A.nextChapter = () => this.readingFlow === 'page' ? this.turnPage(1) : this.scrollToAdjacent(1);
     A.prevChapter = () => this.readingFlow === 'page' ? this.turnPage(-1) : this.scrollToAdjacent(-1);
   };
+  F.positionKey=function(){return A.book?'yj-pos-'+A.book.id:''};
+  F.positionHistory=function(){return readState(this.positionKey(),{items:[],cursor:-1})};
+  F.capturePosition=function(reason='阅读'){if(!A.book||this.positionNavigating)return;const sc=document.getElementById('readingScroll'),state=this.positionHistory(),item={chapter:A.chapter,scroll:sc.scrollTop||0,page:this.pageIndex||0,title:A.book.chapters[A.chapter]?.title||'',reason,at:Date.now()},last=state.items[state.cursor];if(last&&last.chapter===item.chapter&&Math.abs((last.scroll||0)-item.scroll)<60)return;state.items=state.items.slice(0,state.cursor+1);state.items.push(item);state.items=state.items.slice(-60);state.cursor=state.items.length-1;saveState(this.positionKey(),state)};
+  F.navigatePosition=async function(direction){const state=this.positionHistory(),next=state.cursor+direction;if(next<0||next>=state.items.length)return A.toast('没有更早或更晚的阅读位置');state.cursor=next;saveState(this.positionKey(),state);const item=state.items[next];this.positionNavigating=true;await A.loadChapter(item.chapter,false);requestAnimationFrame(()=>{if(this.readingFlow==='page'){this.pageIndex=item.page||0;this.updatePage(false)}else document.getElementById('readingScroll').scrollTo({top:item.scroll||0,behavior:'smooth'});this.positionNavigating=false})};
   F.setReadingFlow = function (mode, persist = true) {
     this.readingFlow = mode === 'page' ? 'page' : 'scroll';
     if (persist) saveState('readingFlow', this.readingFlow);
@@ -213,6 +221,7 @@
   F.afterChapterLoad = function () {
     this.resetReadingLayout();
     if (this.readingFlow === 'page') this.setupPageMode(); else this.setupContinuousMode();
+    this.installReaderLinks(document.getElementById('reading'));
   };
   F.createChapterSection = function (index, data, existingNodes) {
     const section = document.createElement('section');
@@ -222,8 +231,9 @@
     else {
       const temp = document.createElement('div'); A.renderContent(temp, data.html, data.base); section.append(...temp.childNodes);
     }
-    this.decorateRoot(section, index); return section;
+    this.decorateRoot(section, index); this.installReaderLinks(section); return section;
   };
+  F.installReaderLinks=function(root){root.querySelectorAll('a[href]:not([data-yj-link])').forEach(link=>{link.dataset.yjLink='1';link.onclick=event=>{event.preventDefault();event.stopPropagation();const href=link.getAttribute('href')||'',hash=href.includes('#')?href.split('#').pop():'',target=hash&&document.getElementById(decodeURIComponent(hash));const layer=document.createElement('div');layer.className='reader-link-sheet';layer.innerHTML=`<section><header><div><small>${target?'脚注':'链接'}</small><h2>${esc(target?(link.textContent||'查看注释'):'离开阅读页前确认')}</h2></div><button>×</button></header><div class="reader-link-body">${esc(target?(target.textContent||'该脚注没有文字'):href)}</div><footer>${!target&&/^https?:/i.test(href)?`<button class="action" data-open>打开网页</button>`:''}<button data-close>返回阅读</button></footer></section>`;document.body.append(layer);const close=()=>layer.remove();layer.querySelector('header button').onclick=close;layer.querySelector('[data-close]').onclick=close;const open=layer.querySelector('[data-open]');if(open)open.onclick=()=>{Yuejian.openExternal(href);close()}}})};
   F.setupContinuousMode = function () {
     const host = document.getElementById('reading'), scroll = document.getElementById('readingScroll');
     const nodes = [...host.childNodes]; host.replaceChildren(this.createChapterSection(A.chapter, null, nodes));
@@ -543,5 +553,5 @@
   };
   F.changeQuotePage=function(step){this.quotePage=(Number(this.quotePage)||0)+step;this.renderQuotes();document.getElementById('quoteList')?.scrollIntoView({behavior:'smooth',block:'start'});};
 
-  A.showAbout = () => A.toast('阅见 Android 1.2.9 · 阅读页内翻译');
+  A.showAbout = () => A.toast('阅见 Android 1.3.0 · 阅读页内翻译');
 })();

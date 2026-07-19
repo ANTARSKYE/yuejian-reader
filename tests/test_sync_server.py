@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 
-from sync_server import DISCOVERY_REQUEST, PROTOCOL, SyncError, SyncStore, make_handler, serve_discovery
+from sync_server import DISCOVERY_REQUEST, PROTOCOL, TOKEN_MAX_IDLE_MS, LoginRateLimiter, SyncError, SyncStore, make_handler, now_ms, serve_discovery
 from http.server import ThreadingHTTPServer
 
 
@@ -54,6 +54,26 @@ def test_register_login_password_and_token(tmp_path):
     assert token != registered["accessToken"]
 
 
+def test_idle_access_token_expires(tmp_path):
+    store = SyncStore(tmp_path)
+    registered = store.register("reader", "correct-password", device(), "Windows")
+    with store.connect() as db:
+        db.execute("UPDATE devices SET last_seen_at=?", (now_ms() - TOKEN_MAX_IDLE_MS - 1,))
+    with pytest.raises(SyncError) as expired:
+        store.authenticate("Bearer " + registered["accessToken"])
+    assert expired.value.status == 401
+
+
+def test_login_rate_limiter_blocks_repeated_failures():
+    limiter = LoginRateLimiter()
+    key = limiter.check("127.0.0.1", "reader")
+    for _ in range(8):
+        limiter.failed(key)
+    with pytest.raises(SyncError) as limited:
+        limiter.check("127.0.0.1", "reader")
+    assert limited.value.status == 429
+
+
 def test_idempotent_exchange_and_second_device_pull(tmp_path):
     store = SyncStore(tmp_path)
     first, second = device(), device()
@@ -85,10 +105,29 @@ def test_tombstone_newer_than_old_upsert(tmp_path):
     store.exchange(auth1, exchange_request(first, [deleted]))
     stale = change("annotation", "note-1", "old", 100)
     result = store.exchange(auth2, exchange_request(second, [stale]))
-    assert result["conflicts"][0]["reason"] == "remote_newer"
+    assert result["conflicts"][0]["reason"] == "deleted_on_another_device"
     with store.connect() as db:
         row = db.execute("SELECT deleted,updated_at FROM entities").fetchone()
     assert tuple(row) == (1, 200)
+
+
+def test_tombstone_requires_explicit_restore(tmp_path):
+    store = SyncStore(tmp_path)
+    first, second = device(), device()
+    account = store.register("reader", "correct-password", first, "Windows")
+    phone = store.login("reader", "correct-password", second, "Android")
+    auth1 = store.authenticate("Bearer " + account["accessToken"])
+    auth2 = store.authenticate("Bearer " + phone["accessToken"])
+    deleted = change("book", "a" * 64, "", 200)
+    deleted["operation"] = "delete"
+    deleted["payload"] = {"updatedAt": 200}
+    store.exchange(auth1, exchange_request(first, [deleted]))
+    restored = change("book", "a" * 64, "restored", 300)
+    restored["payload"]["restoreDeleted"] = True
+    result = store.exchange(auth2, exchange_request(second, [restored]))
+    assert not result["conflicts"]
+    with store.connect() as db:
+        assert db.execute("SELECT deleted FROM entities").fetchone()[0] == 0
 
 
 def test_blob_hash_is_verified(tmp_path):

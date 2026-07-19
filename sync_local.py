@@ -25,7 +25,7 @@ SYNC_KEYS = {
     "yuejian-profile-name", "yuejian-profile-avatar", "yuejian-quotes",
     "yuejian-quote-library", "yuejian-share-bookmarks",
 }
-SYNC_KEY_PREFIXES = ("yuejian-qa-topic-",)
+SYNC_KEY_PREFIXES = ("yuejian-qa-topic-", "yj-pos-")
 FORBIDDEN_PARTS = ("api-key", "api_key", "token", "local-path", "local_path", "cookie", "log")
 
 
@@ -56,6 +56,7 @@ class LocalSyncManager:
         self.cursor_file = self.data_dir / "sync-cursor.json"
         self.blob_outbox_file = self.data_dir / "sync-blobs.json"
         self.blob_download_file = self.data_dir / "sync-blob-downloads.json"
+        self.deleted_books_file = self.data_dir / "sync-deleted-books.json"
         self.protect = protect
         self.unprotect = unprotect
         self.opener = opener or urllib.request.urlopen
@@ -155,6 +156,7 @@ class LocalSyncManager:
             return
         updated = _now()
         if deleted:
+            update_json(self.deleted_books_file, {}, lambda current: {**(current if isinstance(current, dict) else {}), str(book_id): updated})
             self._record_book_related_deletions(str(book_id), updated)
             self.record_change("book", book_id, "delete", {"updatedAt": updated})
             update_json(self.blob_outbox_file, {}, lambda current: {key: value for key, value in (current if isinstance(current, dict) else {}).items() if key != book_id})
@@ -165,10 +167,17 @@ class LocalSyncManager:
             return
         payload = {
             "id": book_id, "bookId": book_id, "title": str(entry.get("title", "未命名书籍"))[:500],
+            "author": str(entry.get("author", ""))[:120], "category": str(entry.get("category", "未分类"))[:40],
+            "tags": [str(item)[:24] for item in entry.get("tags", []) if str(item).strip()][:12],
+            "description": str(entry.get("description", ""))[:1000],
             "type": extension[1:], "originalName": str(entry.get("original_name", ""))[:240],
             "fileSize": int(entry.get("file_size", 0) or 0), "addedAt": entry.get("added_at", ""),
             "lastOpened": entry.get("last_opened", ""), "updatedAt": updated, "blobSha256": book_id,
         }
+        deleted_books = read_json(self.deleted_books_file, {})
+        if isinstance(deleted_books, dict) and str(book_id) in deleted_books:
+            payload["restoreDeleted"] = True
+            update_json(self.deleted_books_file, {}, lambda current: {key: value for key, value in (current if isinstance(current, dict) else {}).items() if key != str(book_id)})
         self.record_change("book", book_id, "upsert", payload)
         update_json(self.blob_outbox_file, {}, lambda current: {**(current if isinstance(current, dict) else {}), book_id: {"file": stored, "contentType": "application/epub+zip" if extension == ".epub" else "text/plain"}})
 
@@ -520,6 +529,7 @@ class LocalSyncManager:
 
         if entity_type in {"book", "book_meta"}:
             if operation == "delete":
+                update_json(self.deleted_books_file, {}, lambda current: {**(current if isinstance(current, dict) else {}), entity_id: int(payload.get("updatedAt", _now()) or _now())})
                 update_json(self.blob_download_file, {}, lambda current: {key: value for key, value in (current if isinstance(current, dict) else {}).items() if key != entity_id})
                 library_file = self.data_dir / "library.json"
                 removed = {}
@@ -543,8 +553,24 @@ class LocalSyncManager:
                         if isinstance(values, dict): values.pop(entity_id, None); state[key] = json.dumps(values, ensure_ascii=False)
                     return state
                 update_json(self.ui_state_file, {}, remove_book_state)
-            elif len(entity_id) == 64 and payload.get("blobSha256") == entity_id:
-                update_json(self.blob_download_file, {}, lambda current: {**(current if isinstance(current, dict) else {}), entity_id: payload})
+            elif len(entity_id) == 64:
+                library_file = self.data_dir / "library.json"
+                def merge_metadata(library):
+                    library = library if isinstance(library, dict) else {}
+                    current = library.get(entity_id) if isinstance(library.get(entity_id), dict) else {}
+                    if current:
+                        current.update({
+                            "title": str(payload.get("title") or current.get("title") or "未命名书籍")[:500],
+                            "author": str(payload.get("author", current.get("author", "")))[:120],
+                            "category": str(payload.get("category", current.get("category", "未分类")))[:40] or "未分类",
+                            "tags": [str(item)[:24] for item in payload.get("tags", current.get("tags", [])) if str(item).strip()][:12],
+                            "description": str(payload.get("description", current.get("description", "")))[:1000],
+                        })
+                        library[entity_id] = current
+                    return library
+                update_json(library_file, {}, merge_metadata)
+                if payload.get("blobSha256") == entity_id:
+                    update_json(self.blob_download_file, {}, lambda current: {**(current if isinstance(current, dict) else {}), entity_id: payload})
         def merge(state):
             state = state if isinstance(state, dict) else {}
             try:
@@ -592,6 +618,10 @@ class LocalSyncManager:
                 current[digest] = {
                     **previous,
                     "title": str(metadata.get("title") or previous.get("title") or "同步书籍"),
+                    "author": str(metadata.get("author", previous.get("author", "")))[:120],
+                    "category": str(metadata.get("category", previous.get("category", "未分类")))[:40] or "未分类",
+                    "tags": [str(item)[:24] for item in metadata.get("tags", previous.get("tags", [])) if str(item).strip()][:12],
+                    "description": str(metadata.get("description", previous.get("description", "")))[:1000],
                     "original_name": Path(str(metadata.get("originalName") or stored_name)).name[:240],
                     "stored_name": stored_name,
                     "file_size": target.stat().st_size,

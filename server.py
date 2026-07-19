@@ -38,16 +38,18 @@ from sync_local import LocalSyncManager
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Yuejian"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.4.8"
+VERSION = "1.5.0"
 CACHE_FILE = APP_DATA_DIR / "analysis-cache.json"
 TIMING_FILE = APP_DATA_DIR / "analysis-timings.json"
 CHUNK_CACHE_FILE = APP_DATA_DIR / "analysis-chunks.json"
 AI_CONFIG_FILE = APP_DATA_DIR / "ai-config.secure.json"
 LIBRARY_DIR = APP_DATA_DIR / "library"
 LIBRARY_FILE = APP_DATA_DIR / "library.json"
+SEARCH_INDEX_DIR = APP_DATA_DIR / "search-index"
 UI_STATE_FILE = APP_DATA_DIR / "ui-state.json"
 TRANSLATION_CACHE_FILE = APP_DATA_DIR / "translation-cache.json"
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+SEARCH_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD = 30 * 1024 * 1024
 MAX_UI_STATE = 16 * 1024 * 1024
 MAX_AI_CHARS = 240_000
@@ -330,7 +332,11 @@ def remember_book(book_hash, original_name, title, data):
         library = library if isinstance(library, dict) else {}
         previous = library.get(book_hash, {})
         library[book_hash] = {
-            "title": title,
+            "title": previous.get("title") or title,
+            "author": previous.get("author", ""),
+            "category": previous.get("category", "未分类"),
+            "tags": previous.get("tags", []),
+            "description": previous.get("description", ""),
             "original_name": Path(original_name).name[:240],
             "stored_name": stored_name,
             "file_size": len(data),
@@ -344,10 +350,64 @@ def remember_book(book_hash, original_name, title, data):
     SYNC_MANAGER.record_book(book_hash, library.get(book_hash, {}))
 
 
+def save_search_index(book_hash, chapters):
+    rows = []
+    for index, chapter in enumerate(chapters):
+        rows.append({"index": index, "title": chapter.get("title", f"第 {index + 1} 章"),
+                     "depth": max(0, min(8, int(chapter.get("depth", 0) or 0))),
+                     "text": re.sub(r"\s+", " ", chapter.get("text", "")).strip()})
+    write_json(SEARCH_INDEX_DIR / f"{book_hash}.json", rows)
+
+
+def search_library(query, book_hash="", limit=100):
+    query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not (1 <= len(query) <= 100):
+        raise ValueError("请输入 1–100 个字符进行搜索。")
+    needle = query.casefold()
+    results = []
+    library = load_library()
+    targets = [(book_hash, library.get(book_hash))] if book_hash else list(library.items())
+    for current_hash, entry in targets:
+        if not entry:
+            continue
+        index_path = SEARCH_INDEX_DIR / f"{current_hash}.json"
+        rows = read_json(index_path, [])
+        if not isinstance(rows, list) or not rows:
+            stored = LIBRARY_DIR / str(entry.get("stored_name", ""))
+            if not stored.exists():
+                continue
+            try:
+                _, chapters = extract_book(entry.get("original_name", stored.name), stored.read_bytes(), current_hash)
+                save_search_index(current_hash, chapters)
+                rows = read_json(index_path, [])
+            except (ValueError, OSError, zipfile.BadZipFile):
+                continue
+        for row in rows:
+            text = str(row.get("text", ""))
+            folded = text.casefold()
+            start = 0
+            while len(results) < limit:
+                found = folded.find(needle, start)
+                if found < 0:
+                    break
+                left, right = max(0, found - 48), min(len(text), found + len(query) + 72)
+                results.append({"book_hash": current_hash, "book_title": entry.get("title", "未命名书籍"),
+                                "chapter": int(row.get("index", 0)), "chapter_title": row.get("title", "正文"),
+                                "snippet": ("…" if left else "") + text[left:right] + ("…" if right < len(text) else ""),
+                                "offset": found})
+                start = found + max(1, len(query))
+            if len(results) >= limit:
+                break
+        if len(results) >= limit:
+            break
+    return results
+
+
 def prepare_book_payload(name, data):
     book_hash = hashlib.sha256(data).hexdigest()
     title, chapters = extract_book(name, data, book_hash)
     remember_book(book_hash, name, title, data)
+    save_search_index(book_hash, chapters)
     excerpt = compact_book(chapters)
     session_id = secrets.token_urlsafe(18)
     source_chars = sum(len(x["text"]) for x in chapters)
@@ -356,7 +416,8 @@ def prepare_book_payload(name, data):
     complexity, complexity_score, estimated_seconds, timing_samples = estimate_analysis("\n".join(x["text"] for x in chapters), chapters)
     SESSIONS.put(session_id, {"title": title, "text": excerpt, "chapters": chapters, "book_hash": book_hash, "source_chars": source_chars, "complexity_score": complexity_score, "estimated_seconds": estimated_seconds, "chunk_target_chars": chunk_plan["target_chars"], "analysis_chunks": analysis_chunks})
     cached = load_analysis_cache().get(book_hash)
-    return {"title": title, "chapters": [x["title"] for x in chapters], "session_id": session_id, "book_hash": book_hash, "total_chars": source_chars, "analyzed_chars": source_chars, "complexity": complexity, "estimated_seconds": estimated_seconds, "analysis_chunks": analysis_chunks, "chunk_target_chars": chunk_plan["target_chars"], "timing_samples": timing_samples, "estimate_method": "learned" if timing_samples else "baseline", "cached_analysis": cached.get("analysis") if cached else None, "cache_meta": {key: cached.get(key) for key in ("provider", "model", "analyzed_at", "revision_count")} if cached else None}
+    entry = load_library().get(book_hash, {})
+    return {"title": entry.get("title", title), "author": entry.get("author", ""), "category": entry.get("category", "未分类"), "tags": entry.get("tags", []), "description": entry.get("description", ""), "chapters": [x["title"] for x in chapters], "chapter_items": [{"title": x["title"], "depth": int(x.get("depth", 0) or 0)} for x in chapters], "session_id": session_id, "book_hash": book_hash, "total_chars": source_chars, "analyzed_chars": source_chars, "complexity": complexity, "estimated_seconds": estimated_seconds, "analysis_chunks": analysis_chunks, "chunk_target_chars": chunk_plan["target_chars"], "timing_samples": timing_samples, "estimate_method": "learned" if timing_samples else "baseline", "cached_analysis": cached.get("analysis") if cached else None, "cache_meta": {key: cached.get(key) for key in ("provider", "model", "analyzed_at", "revision_count")} if cached else None}
 
 
 def persist_analysis(session, analysis, revision_count):
@@ -463,6 +524,9 @@ class ReaderSanitizer(HTMLParser):
             href = values.get("href", "")
             if href.startswith("#") and re.fullmatch(r"#[A-Za-z0-9_.:-]{1,120}", href):
                 safe_attrs.append(f'href="{escape(href, quote=True)}"')
+            elif href and urlparse(href).scheme.lower() in ("http", "https"):
+                safe_attrs.append(f'href="{escape(href[:2000], quote=True)}"')
+                safe_attrs.append('rel="noopener noreferrer"')
         attributes = (" " + " ".join(safe_attrs)) if safe_attrs else ""
         self.parts.append(f"<{tag}{attributes}>")
 
@@ -514,14 +578,20 @@ def epub_toc_entries(archive, manifest, base):
             root = ET.fromstring(archive.read(path))
         except (KeyError, ET.ParseError):
             continue
-        for node in root.iter():
+        def walk(node, depth=0):
+            local = node.tag.rsplit("}", 1)[-1]
+            next_depth = depth + (1 if local in ("li", "navPoint") else 0)
+            yield node, max(0, depth - 1 if local == "a" else depth)
+            for child in list(node):
+                yield from walk(child, next_depth)
+        for node, depth in walk(root):
             if node.tag.endswith("a") and node.attrib.get("href"):
                 target, _, fragment = node.attrib["href"].partition("#")
                 full = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(target)))
                 label = clean_title("".join(node.itertext()))
                 key = (full, unquote(fragment), label)
                 if label and key not in seen:
-                    entries.append({"path": full, "fragment": unquote(fragment), "title": label})
+                    entries.append({"path": full, "fragment": unquote(fragment), "title": label, "depth": min(8, depth)})
                     seen.add(key)
             if node.tag.endswith("navPoint"):
                 source = next((child.attrib.get("src") for child in node.iter() if child.tag.endswith("content")), "")
@@ -531,7 +601,7 @@ def epub_toc_entries(archive, manifest, base):
                     full = posixpath.normpath(posixpath.join(posixpath.dirname(path), unquote(target)))
                     key = (full, unquote(fragment), label)
                     if key not in seen:
-                        entries.append({"path": full, "fragment": unquote(fragment), "title": label})
+                        entries.append({"path": full, "fragment": unquote(fragment), "title": label, "depth": min(8, depth)})
                         seen.add(key)
     return entries
 
@@ -555,16 +625,16 @@ def split_epub_document(document, toc_entries):
             start = 0
         if markers and start <= markers[-1][0]:
             continue
-        markers.append((start, entry["title"]))
+        markers.append((start, entry["title"], entry.get("depth", 0)))
     if not markers:
         return [{key: value for key, value in document.items() if key != "path"}]
     result = []
-    for index, (start, title) in enumerate(markers):
+    for index, (start, title, depth) in enumerate(markers):
         end = markers[index + 1][0] if index + 1 < len(markers) else len(html)
         fragment_html = html[start:end].strip()
         text = html_to_text(fragment_html.encode("utf-8"))
         if text or "<img" in fragment_html.lower():
-            result.append({"title": title, "text": text, "html": fragment_html})
+            result.append({"title": title, "text": text, "html": fragment_html, "depth": depth})
     return result
 
 
@@ -1822,6 +1892,30 @@ class App(SimpleHTTPRequestHandler):
                 payload = self.read_json(16_000)
                 self.send_json(200, delete_library_book(str(payload.get("book_hash", ""))))
                 return
+            if self.path == "/api/library/update":
+                payload = self.read_json(32_000)
+                book_hash = str(payload.get("book_hash", ""))
+                if not re.fullmatch(r"[a-f0-9]{64}", book_hash):
+                    raise ValueError("书籍标识无效。")
+                def clean(value, maximum):
+                    return re.sub(r"\s+", " ", str(value or "")).strip()[:maximum]
+                def update(library):
+                    if book_hash not in library:
+                        raise ValueError("书籍不存在。")
+                    entry = library[book_hash]
+                    entry["title"] = clean(payload.get("title"), 160) or entry.get("title", "未命名书籍")
+                    entry["author"] = clean(payload.get("author"), 120)
+                    entry["category"] = clean(payload.get("category"), 40) or "未分类"
+                    raw_tags = payload.get("tags", [])
+                    if isinstance(raw_tags, str): raw_tags = raw_tags.split(",")
+                    entry["tags"] = list(dict.fromkeys(clean(x, 24) for x in raw_tags if clean(x, 24)))[:12]
+                    entry["description"] = clean(payload.get("description"), 1000)
+                    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    return library
+                library = update_json(LIBRARY_FILE, {}, update)
+                SYNC_MANAGER.record_book(book_hash, library[book_hash])
+                self.send_json(200, {"book_hash": book_hash, **library[book_hash]})
+                return
             if self.path == "/api/cache/clear":
                 payload = self.read_json(16_000)
                 self.send_json(200, clear_analysis_data(str(payload.get("book_hash", ""))))
@@ -1953,9 +2047,20 @@ class App(SimpleHTTPRequestHandler):
             books = []
             for book_hash, entry in library_with_covers().items():
                 cover_name = entry.get("cover_name", "")
-                books.append({"book_hash": book_hash, "title": entry.get("title", "未命名书籍"), "original_name": entry.get("original_name", ""), "file_size": entry.get("file_size", 0), "added_at": entry.get("added_at", ""), "last_opened": entry.get("last_opened", ""), "analyzed": book_hash in cache, "has_cover": bool(cover_name), "cover_url": f"/api/library/cover?book_hash={book_hash}" if cover_name else ""})
+                books.append({"book_hash": book_hash, "title": entry.get("title", "未命名书籍"), "author": entry.get("author", ""), "category": entry.get("category", "未分类"), "tags": entry.get("tags", []), "description": entry.get("description", ""), "original_name": entry.get("original_name", ""), "file_size": entry.get("file_size", 0), "added_at": entry.get("added_at", ""), "last_opened": entry.get("last_opened", ""), "analyzed": book_hash in cache, "has_cover": bool(cover_name), "cover_url": f"/api/library/cover?book_hash={book_hash}" if cover_name else ""})
             books.sort(key=lambda item: item.get("last_opened", ""), reverse=True)
             self.send_json(200, {"books": books})
+            return
+        if parsed.path == "/api/library/search":
+            query = parse_qs(parsed.query)
+            q = query.get("q", [""])[0]
+            book_hash = query.get("book_hash", [""])[0]
+            if book_hash and not re.fullmatch(r"[a-f0-9]{64}", book_hash):
+                self.send_json(400, {"error": "书籍标识无效。"}); return
+            try:
+                self.send_json(200, {"results": search_library(q, book_hash)})
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
             return
         if parsed.path == "/api/library/cover":
             book_hash = parse_qs(parsed.query).get("book_hash", [""])[0]

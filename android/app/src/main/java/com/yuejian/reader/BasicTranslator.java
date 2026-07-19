@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -47,7 +48,7 @@ final class BasicTranslator {
                 if (translated.length() > 0) translated.append('\n');
                 translated.append(future.get());
             }
-            repository.saveState(cacheKey, translated.toString());
+            repository.saveTranslationCache(cacheKey, translated.toString());
             return result(translated.toString(), target, false);
         } finally { pool.shutdownNow(); }
     }
@@ -61,7 +62,7 @@ final class BasicTranslator {
         // charset overload is available across the app's full Android 8+ range.
         String query = "q=" + URLEncoder.encode(text, "UTF-8") + "&langpair=" + URLEncoder.encode(source + "|" + target, "UTF-8") + "&mt=1";
         HttpURLConnection connection = (HttpURLConnection) new URL("https://api.mymemory.translated.net/get?" + query).openConnection();
-        connection.setConnectTimeout(8000); connection.setReadTimeout(8000); connection.setRequestProperty("User-Agent", "YuejianAndroid/1.2.9");
+        connection.setConnectTimeout(8000); connection.setReadTimeout(8000); connection.setRequestProperty("User-Agent", "YuejianAndroid/1.3.0");
         try {
             int status = connection.getResponseCode();
             InputStream stream = status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream();
@@ -70,7 +71,7 @@ final class BasicTranslator {
             int responseStatus = payload.optInt("responseStatus", status);
             String translated = Html.fromHtml(payload.optJSONObject("responseData") == null ? "" : payload.optJSONObject("responseData").optString("translatedText"), Html.FROM_HTML_MODE_LEGACY).toString().trim();
             if (responseStatus == 200 && !translated.isEmpty()) return translated;
-            String detail = payload.optString("responseDetails").toLowerCase();
+            String detail = payload.optString("responseDetails").toLowerCase(Locale.ROOT);
             if (detail.contains("quota") || detail.contains("limit")) throw new IllegalArgumentException("基础翻译今日公共额度暂不可用，请稍后重试或使用 AI 翻译");
             throw new IllegalArgumentException("基础翻译暂时没有返回结果，请稍后重试");
         } catch (java.net.SocketTimeoutException error) {

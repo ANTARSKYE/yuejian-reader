@@ -174,6 +174,19 @@ def test_remote_book_delete_removes_other_device_copy(tmp_path, sync_service):
     assert not (tmp_path / "second" / "library" / f"{digest}.txt").exists()
 
 
+def test_explicit_reimport_marks_deleted_book_for_restore(tmp_path):
+    client = manager(tmp_path)
+    content = b"reimported book"
+    digest = hashlib.sha256(content).hexdigest()
+    entry = {"title": "Restore Me", "original_name": "restore.txt", "stored_name": f"{digest}.txt", "file_size": len(content)}
+    client.record_book(digest, entry, deleted=True)
+    client.record_book(digest, entry)
+    book_changes = [item for item in client._outbox() if item["entityType"] == "book"]
+    assert len(book_changes) == 1
+    assert book_changes[0]["operation"] == "upsert"
+    assert book_changes[0]["payload"]["restoreDeleted"] is True
+
+
 def test_ai_report_syncs_without_ai_credentials_and_is_marked_cached(tmp_path, sync_service):
     book_id = "b" * 64
     desktop = manager(tmp_path / "desktop")

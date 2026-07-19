@@ -10,6 +10,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class AiClient {
@@ -98,7 +99,7 @@ final class AiClient {
     }
 
     private static Exception httpError(int status, String response) {
-        String lower = String.valueOf(response).toLowerCase();
+        String lower = String.valueOf(response).toLowerCase(Locale.ROOT);
         String[] markers = {"insufficient_quota","insufficient quota","insufficient balance","account balance","billing","payment required","credit balance","recharge","余额不足","额度不足","欠费","充值"};
         if (status == 402) return new IllegalArgumentException(BALANCE_WARNING);
         for (String marker : markers) if (lower.contains(marker)) return new IllegalArgumentException(BALANCE_WARNING);
