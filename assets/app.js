@@ -4,7 +4,7 @@ import { initializePersistentStorage, refreshPersistentStorage } from "./ui-stor
 const launchParameters = new URLSearchParams(location.search);
 if (launchParameters.has("desktop")) {
   document.body.classList.add("desktop");
-  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.5.0";
+  document.getElementById("brandSub").textContent = "Windows 桌面版 · v1.5.2";
 }
 if (launchParameters.has("token"))
   history.replaceState(
@@ -36,27 +36,48 @@ let sessionId = "",
 let positionNavigation = false;
 function positionKey() { return "yj-pos-" + String(currentBookKey || "").slice(0, 64); }
 function positionState() {
-  try { return JSON.parse(localStorage.getItem(positionKey()) || '{"items":[],"cursor":-1}'); }
+  try {
+    const state = JSON.parse(localStorage.getItem(positionKey()) || '{"items":[],"cursor":-1}');
+    if (!Array.isArray(state.items)) state.items = [];
+    if (!Number.isInteger(state.cursor)) state.cursor = state.items.length - 1;
+    state.cursor = Math.min(state.items.length - 1, Math.max(-1, state.cursor));
+    return state;
+  }
   catch { return { items: [], cursor: -1 }; }
+}
+function updatePositionHistoryButtons(state = positionState()) {
+  const back = document.getElementById("readerHistoryBack"), forward = document.getElementById("readerHistoryForward");
+  if (back) back.disabled = state.cursor <= 0;
+  if (forward) forward.disabled = state.cursor < 0 || state.cursor >= state.items.length - 1;
 }
 function captureReadingPosition(reason = "跳转") {
   if (!currentBookKey || !currentBookData || positionNavigation) return;
   const state = positionState(), item = { chapter: currentChapterIndex, page: desktopPageIndex || 0,
     scroll: Math.max(0, window.scrollY || 0), title: desktopChapterTitle(currentChapterIndex), reason, at: Date.now() };
   const previous = state.items[state.cursor];
-  if (previous && previous.chapter === item.chapter && Math.abs((previous.scroll || 0) - item.scroll) < 80) return;
+  const samePage = desktopReaderFlow !== "page" || (previous?.page || 0) === item.page;
+  if (previous && previous.chapter === item.chapter && samePage && Math.abs((previous.scroll || 0) - item.scroll) < 80) {
+    previous.at = item.at; previous.reason = reason;
+    localStorage.setItem(positionKey(), JSON.stringify(state));
+    updatePositionHistoryButtons(state);
+    return;
+  }
   state.items = state.items.slice(0, state.cursor + 1);
   state.items.push(item); state.items = state.items.slice(-60); state.cursor = state.items.length - 1;
   localStorage.setItem(positionKey(), JSON.stringify(state));
+  updatePositionHistoryButtons(state);
 }
 async function navigatePosition(direction) {
   const state = positionState(), next = state.cursor + direction;
   if (next < 0 || next >= state.items.length) return showNotice("没有更早或更晚的阅读位置。", true);
-  state.cursor = next; localStorage.setItem(positionKey(), JSON.stringify(state));
+  state.cursor = next; localStorage.setItem(positionKey(), JSON.stringify(state)); updatePositionHistoryButtons(state);
   const item = state.items[next]; positionNavigation = true;
-  await loadChapter(item.chapter);
-  requestAnimationFrame(() => { if (desktopReaderFlow === "page") { desktopPageIndex = item.page || 0; updateDesktopPage(false); }
-    else window.scrollTo({ top: item.scroll || 0, behavior: "smooth" }); positionNavigation = false; });
+  try {
+    await loadChapter(item.chapter);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (desktopReaderFlow === "page") { desktopPageIndex = Math.max(0, Math.min(item.page || 0, desktopPageCount - 1)); updateDesktopPage(false); }
+    else window.scrollTo({ top: item.scroll || 0, behavior: "smooth" });
+  } finally { positionNavigation = false; updatePositionHistoryButtons(state); }
 }
 const escapeHtml = (value) =>
   String(value ?? "").replace(
@@ -66,6 +87,16 @@ const escapeHtml = (value) =>
         c
       ],
   );
+function tocItemsWithDepth(items) {
+  const normalized = items.map((item) => ({ ...item, depth: Math.max(0, Math.min(8, Number(item.depth) || 0)) }));
+  if (normalized.some((item) => item.depth > 0)) return normalized;
+  let insideMajor = false;
+  return normalized.map((item) => {
+    const major = /^(?:第[\s\S]{1,10}[卷部篇编章]|(?:part|book|volume)\s+[\divxlcdm]+)/i.test(String(item.title || "").trim());
+    if (major) insideMajor = true;
+    return { ...item, depth: insideMajor && !major ? 1 : 0 };
+  });
+}
 function openExclusiveModal(modal) {
   document.querySelectorAll(".modal.open").forEach((item) => {
     if (item !== modal) item.classList.remove("open");
@@ -1464,7 +1495,7 @@ async function loadChapter(index) {
       (data.index + 1) +
       " / " +
       data.total +
-      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><span class="reader-history-actions"><button id="readerHistoryBack" title="返回上一个阅读位置">↶ 位置</button><button id="readerHistoryForward" title="前往下一个阅读位置">位置 ↷</button></span><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><button id="copySelection">复制</button><button id="shareSelection">分享书签</button><button id="selectParagraph">段落全选</button><button id="translateSelection">快速翻译</button><button id="aiTranslateSelection">AI 翻译</button><i class="tool-divider"></i><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
+      ' 章</span></div></div><div class="reader-format-bar"><label>字体 <select id="readerFont"><option value="serif">宋体阅读</option><option value="yahei">微软雅黑</option><option value="kaiti">楷体</option><option value="heiti">黑体</option></select></label><label>字号 <input id="readerFontSize" type="range" min="14" max="30" step="1"><span class="reader-size-value" id="readerSizeValue">17 px</span></label><label>翻阅方式 <select id="desktopReaderFlow"><option value="scroll">连续滑动</option><option value="page">左右翻页</option></select></label><span class="reader-history-actions"><button id="readerHistoryBack" title="返回更早的阅读位置">↶ 更早</button><button id="readerHistoryForward" title="前往更晚的阅读位置">更晚 ↷</button></span><button class="reader-annotations-button" id="manageAnnotations">批注与高亮</button></div><div class="selection-toolbar" id="selectionToolbar"><button id="copySelection">复制</button><button id="shareSelection">分享书签</button><button id="selectParagraph">段落全选</button><button id="translateSelection">快速翻译</button><button id="aiTranslateSelection">AI 翻译</button><i class="tool-divider"></i><button id="addNote">批注</button><button class="mark-color amber" id="markAmber" title="黄色高亮"></button><button class="mark-color red" id="markRed" title="红色高亮"></button><button class="mark-color blue" id="markBlue" title="蓝色高亮"></button><button class="mark-color green" id="markGreen" title="绿色高亮"></button><button id="aiExplain">AI 解析</button><button id="clearSelection">取消</button></div><div class="reader-body">' +
       data.html +
       '</div><div class="reader-nav"><button id="prevChapter" ' +
       (data.index === 0 ? "disabled" : "") +
@@ -1482,6 +1513,7 @@ async function loadChapter(index) {
     document.getElementById("nextChapter").onclick = () =>
       loadChapter(data.index + 1);
     setupDesktopReadingFlow(data);
+    requestAnimationFrame(() => requestAnimationFrame(() => { if (!positionNavigation) captureReadingPosition("到达章节"); updatePositionHistoryButtons(); }));
     document
       .querySelectorAll(".chapters button")
       .forEach((x) => x.classList.remove("active"));
@@ -1807,7 +1839,7 @@ function render(data) {
   currentChapterIndex = Math.max(0, Math.min(data.chapters.length - 1, Number(savedProgress?.chapter) || 0));
   migrateLegacyBookData(data.title, currentBookKey);
   rememberReadingMeta(data);
-  const chapterItems = Array.isArray(data.chapter_items) ? data.chapter_items : data.chapters.map(title => ({ title, depth: 0 }));
+  const chapterItems = tocItemsWithDepth(Array.isArray(data.chapter_items) ? data.chapter_items : data.chapters.map(title => ({ title, depth: 0 })));
   document.querySelector(".chapters").innerHTML =
     '<li><button class="active" data-analysis>AI 分析</button></li>' +
     chapterItems

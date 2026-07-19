@@ -40,7 +40,7 @@
   const originalInit = F.init.bind(F);
   F.init = function () {
     originalInit();
-    A.showAbout = () => A.toast('阅见 Android 1.3.0 · 阅读页内翻译');
+    A.showAbout = () => A.toast('阅见 Android 1.3.2 · 阅读页内翻译');
     this.installReadingExperience();
     this.installAnnotationUi();
     this.installNavigationFeedback();
@@ -184,9 +184,9 @@
     setting.innerHTML = '<label><span>翻阅方式</span><span id="readingFlowLabel">连续滑动</span></label><div class="reading-flow-switch"><button data-flow="scroll">连续滑动</button><button data-flow="page">左右翻页</button></div>';
     document.querySelector('#settingsSheet .sheet').insertBefore(setting, document.querySelector('#settingsSheet .setting:last-of-type'));
     document.querySelectorAll('[data-flow]').forEach(button => button.onclick = () => this.setReadingFlow(button.dataset.flow));
-    document.querySelector('.reader-foot').insertAdjacentHTML('afterbegin','<button class="position-history" id="positionBack" title="上一个阅读位置">↶</button><button class="position-history" id="positionForward" title="下一个阅读位置">↷</button>');
+    document.querySelector('.reader-foot').insertAdjacentHTML('afterbegin','<button class="position-history" id="positionBack" title="更早的阅读位置" aria-label="更早的阅读位置">↶</button><button class="position-history" id="positionForward" title="更晚的阅读位置" aria-label="更晚的阅读位置">↷</button>');
     document.getElementById('positionBack').onclick=()=>this.navigatePosition(-1);document.getElementById('positionForward').onclick=()=>this.navigatePosition(1);
-    A.renderToc=()=>{document.getElementById('toc').innerHTML=A.book.chapters.map((c,i)=>`<button data-i="${i}" style="padding-left:${22+Math.min(8,+c.depth||0)*16}px" onclick="app.jump(${i})">${esc(c.title)}</button>`).join('')};
+    A.renderToc=()=>{const chapters=A.book.chapters,hasNested=chapters.some(c=>(+c.depth||0)>0);let insideMajor=false;document.getElementById('toc').innerHTML=chapters.map((c,i)=>{const major=/^(?:第[\s\S]{1,10}[卷部篇编章]|(?:part|book|volume)\s+[\divxlcdm]+)/i.test(String(c.title||'').trim());if(major)insideMajor=true;const depth=Math.min(8,Math.max(0,hasNested?(+c.depth||0):(insideMajor&&!major?1:0)));return `<button class="toc-level toc-level-${depth}" data-depth="${depth}" data-i="${i}" onclick="app.jump(${i})"><span>${esc(c.title)}</span></button>`}).join('')};
     this.readingFlow = readState('readingFlow', 'scroll');
     this.setReadingFlow(this.readingFlow, false);
     const oldLoad = A.loadChapter.bind(A);
@@ -201,9 +201,10 @@
     A.prevChapter = () => this.readingFlow === 'page' ? this.turnPage(-1) : this.scrollToAdjacent(-1);
   };
   F.positionKey=function(){return A.book?'yj-pos-'+A.book.id:''};
-  F.positionHistory=function(){return readState(this.positionKey(),{items:[],cursor:-1})};
-  F.capturePosition=function(reason='阅读'){if(!A.book||this.positionNavigating)return;const sc=document.getElementById('readingScroll'),state=this.positionHistory(),item={chapter:A.chapter,scroll:sc.scrollTop||0,page:this.pageIndex||0,title:A.book.chapters[A.chapter]?.title||'',reason,at:Date.now()},last=state.items[state.cursor];if(last&&last.chapter===item.chapter&&Math.abs((last.scroll||0)-item.scroll)<60)return;state.items=state.items.slice(0,state.cursor+1);state.items.push(item);state.items=state.items.slice(-60);state.cursor=state.items.length-1;saveState(this.positionKey(),state)};
-  F.navigatePosition=async function(direction){const state=this.positionHistory(),next=state.cursor+direction;if(next<0||next>=state.items.length)return A.toast('没有更早或更晚的阅读位置');state.cursor=next;saveState(this.positionKey(),state);const item=state.items[next];this.positionNavigating=true;await A.loadChapter(item.chapter,false);requestAnimationFrame(()=>{if(this.readingFlow==='page'){this.pageIndex=item.page||0;this.updatePage(false)}else document.getElementById('readingScroll').scrollTo({top:item.scroll||0,behavior:'smooth'});this.positionNavigating=false})};
+  F.positionHistory=function(){const state=readState(this.positionKey(),{items:[],cursor:-1});if(!Array.isArray(state.items))state.items=[];if(!Number.isInteger(state.cursor))state.cursor=state.items.length-1;state.cursor=Math.min(state.items.length-1,Math.max(-1,state.cursor));return state};
+  F.updatePositionButtons=function(state=this.positionHistory()){const back=document.getElementById('positionBack'),forward=document.getElementById('positionForward');if(back)back.disabled=state.cursor<=0;if(forward)forward.disabled=state.cursor<0||state.cursor>=state.items.length-1};
+  F.capturePosition=function(reason='阅读'){if(!A.book||this.positionNavigating)return;const sc=document.getElementById('readingScroll'),state=this.positionHistory(),item={chapter:A.chapter,scroll:sc.scrollTop||0,page:this.pageIndex||0,title:A.book.chapters[A.chapter]?.title||'',reason,at:Date.now()},last=state.items[state.cursor],samePage=this.readingFlow!=='page'||(last?.page||0)===item.page;if(last&&last.chapter===item.chapter&&samePage&&Math.abs((last.scroll||0)-item.scroll)<60){last.at=item.at;last.reason=reason;saveState(this.positionKey(),state);this.updatePositionButtons(state);return}state.items=state.items.slice(0,state.cursor+1);state.items.push(item);state.items=state.items.slice(-60);state.cursor=state.items.length-1;saveState(this.positionKey(),state);this.updatePositionButtons(state)};
+  F.navigatePosition=async function(direction){const state=this.positionHistory(),next=state.cursor+direction;if(next<0||next>=state.items.length)return A.toast('没有更早或更晚的阅读位置');state.cursor=next;saveState(this.positionKey(),state);this.updatePositionButtons(state);const item=state.items[next];this.positionNavigating=true;try{await A.loadChapter(item.chapter,false);await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));if(this.readingFlow==='page'){this.pageIndex=Math.max(0,Math.min(item.page||0,this.pageCount-1));this.updatePage(false)}else document.getElementById('readingScroll').scrollTo({top:item.scroll||0,behavior:'smooth'})}finally{this.positionNavigating=false;this.updatePositionButtons(state)}};
   F.setReadingFlow = function (mode, persist = true) {
     this.readingFlow = mode === 'page' ? 'page' : 'scroll';
     if (persist) saveState('readingFlow', this.readingFlow);
@@ -214,7 +215,7 @@
   };
   F.resetReadingLayout = function () {
     const reading = document.getElementById('reading'), scroll = document.getElementById('readingScroll');
-    reading.classList.remove('page-layout'); reading.style.width = ''; reading.style.columnWidth = ''; reading.style.columnGap = ''; scroll.onscroll = null; scroll.scrollLeft = 0;
+    reading.classList.remove('page-layout'); reading.style.width = ''; reading.style.height = ''; reading.style.minHeight = ''; reading.style.maxHeight = ''; reading.style.columnWidth = ''; reading.style.columnGap = ''; scroll.onscroll = null; scroll.ontouchstart = null; scroll.ontouchmove = null; scroll.ontouchend = null; scroll.scrollLeft = 0;
     this.pageResizeObserver?.disconnect(); this.pageResizeObserver = null;
     this.pageIndex = 0; this.pageCount = 1; this.continuousLoading = false; this.prependLoading = false;
   };
@@ -222,6 +223,7 @@
     this.resetReadingLayout();
     if (this.readingFlow === 'page') this.setupPageMode(); else this.setupContinuousMode();
     this.installReaderLinks(document.getElementById('reading'));
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{if(!this.positionNavigating)this.capturePosition('到达章节');this.updatePositionButtons()}));
   };
   F.createChapterSection = function (index, data, existingNodes) {
     const section = document.createElement('section');
@@ -297,15 +299,19 @@
     host.classList.add('page-layout'); this.pageIndex = 0;
     const layout = () => {
       const style = getComputedStyle(scroll), gap = 36,
-        width = Math.max(280, scroll.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
-      host.style.width = width + 'px'; host.style.columnWidth = width + 'px'; host.style.columnGap = gap + 'px';
+        horizontalPadding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight),
+        verticalPadding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom),
+        width = Math.max(160, Math.floor(scroll.clientWidth - horizontalPadding)),
+        height = Math.max(280, Math.floor(scroll.clientHeight - verticalPadding));
+      host.style.width = width + 'px'; host.style.height = height + 'px'; host.style.minHeight = height + 'px'; host.style.maxHeight = height + 'px'; host.style.columnWidth = width + 'px'; host.style.columnGap = gap + 'px';
       this.pageStep = width + gap; this.pageCount = Math.max(1, Math.ceil((host.scrollWidth + gap) / this.pageStep));
       this.pageIndex = Math.min(this.pageIndex, this.pageCount - 1); this.updatePage(false);
     };
     requestAnimationFrame(layout);
     this.pageResizeObserver?.disconnect(); this.pageResizeObserver = new ResizeObserver(layout); this.pageResizeObserver.observe(scroll);
     let startX = 0, startY = 0;
-    scroll.ontouchstart = event => { const t = event.touches[0]; startX = t.clientX; startY = t.clientY; };
+    scroll.ontouchstart = event => { if(event.touches.length!==1)return;const t = event.touches[0]; startX = t.clientX; startY = t.clientY; };
+    scroll.ontouchmove = event => { if(event.touches.length>1)event.preventDefault(); };
     scroll.ontouchend = event => { const t = event.changedTouches[0], dx = t.clientX - startX, dy = t.clientY - startY; if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy)) this.turnPage(dx < 0 ? 1 : -1); };
   };
   F.turnPage = async function (direction) {
@@ -553,5 +559,5 @@
   };
   F.changeQuotePage=function(step){this.quotePage=(Number(this.quotePage)||0)+step;this.renderQuotes();document.getElementById('quoteList')?.scrollIntoView({behavior:'smooth',block:'start'});};
 
-  A.showAbout = () => A.toast('阅见 Android 1.3.0 · 阅读页内翻译');
+  A.showAbout = () => A.toast('阅见 Android 1.3.2 · 阅读页内翻译');
 })();

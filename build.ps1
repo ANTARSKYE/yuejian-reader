@@ -19,7 +19,6 @@ if (-not (Test-Path -LiteralPath $python)) {
     }
 }
 
-& $python -m pip install --disable-pip-version-check --upgrade pip
 & $python -m pip install --disable-pip-version-check -r requirements-build.txt
 & $python -m pytest
 if ($LASTEXITCODE -ne 0) { throw "Python tests failed with exit code $LASTEXITCODE." }

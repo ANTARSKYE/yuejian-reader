@@ -28,7 +28,7 @@
         </activity>
         <service
             android:name=".SyncJobService"
-            android:exported="true"
+            android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>

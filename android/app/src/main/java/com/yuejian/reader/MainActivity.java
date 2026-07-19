@@ -126,10 +126,13 @@ public class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         int systemZoom = Math.round(getResources().getConfiguration().fontScale * 100f);
         settings.setTextZoom(Math.max(85, Math.min(160, systemZoom)));
+        settings.setSupportZoom(false);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
         settings.setSafeBrowsingEnabled(true);
         settings.setUseWideViewPort(true);
         settings.setLoadWithOverviewMode(false);
-        webView.setBackgroundColor(Color.TRANSPARENT);
+        webView.setBackgroundColor(Color.rgb(7, 22, 49));
         webView.addJavascriptInterface(new AndroidBridge(), "Yuejian");
         webView.setWebChromeClient(new WebChromeClient() {
             @Override public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
@@ -220,12 +223,22 @@ public class MainActivity extends Activity {
     private void scheduleDurableSync() {
         JobScheduler scheduler = (JobScheduler) getSystemService(Context.JOB_SCHEDULER_SERVICE);
         if (scheduler == null) return;
-        JobInfo job = new JobInfo.Builder(SyncJobService.JOB_ID, new ComponentName(this, SyncJobService.class))
-                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setPeriodic(15 * 60 * 1000L)
-                .setPersisted(false)
-                .build();
-        scheduler.schedule(job);
+        if (!accountStore.accountMode()) {
+            scheduler.cancel(SyncJobService.JOB_ID);
+            return;
+        }
+        try {
+            JobInfo job = new JobInfo.Builder(SyncJobService.JOB_ID, new ComponentName(this, SyncJobService.class))
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                    .setPeriodic(15 * 60 * 1000L)
+                    .setPersisted(false)
+                    .build();
+            scheduler.schedule(job);
+        } catch (RuntimeException ignored) {
+            // A few vendor JobScheduler implementations reject otherwise valid
+            // periodic jobs. Foreground minute sync remains available, and a
+            // scheduler incompatibility must never terminate the reader.
+        }
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -443,17 +456,31 @@ public class MainActivity extends Activity {
         @JavascriptInterface public String syncStatus() { try { return syncManager.status().toString(); } catch (Exception error) { return errorJson(error); } }
         @JavascriptInterface public int acknowledgeSync(long cursor) { return repository.acknowledgeSync(cursor); }
         @JavascriptInterface public void accountLoginAsync(String requestId, String serverUrl, String username, String password, boolean register) {
-            executor.execute(() -> { try { nativeResult(requestId, true, syncManager.login(serverUrl, username, password, register, "Android 手机", MainActivity.this::notifySyncProgress)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
+            executor.execute(() -> { try {
+                JSONObject result = syncManager.login(serverUrl, username, password, register, "Android 手机", MainActivity.this::notifySyncProgress);
+                runOnUiThread(MainActivity.this::scheduleDurableSync);
+                nativeResult(requestId, true, result);
+            } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
         }
         @JavascriptInterface public void syncNowAsync(String requestId) {
             executor.execute(() -> { try { nativeResult(requestId, true, syncManager.syncNow(MainActivity.this::notifySyncProgress)); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
         }
         @JavascriptInterface public void accountLogoutAsync(String requestId) {
-            executor.execute(() -> { try { nativeResult(requestId, true, syncManager.logout()); } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
+            executor.execute(() -> { try {
+                JSONObject result = syncManager.logout();
+                runOnUiThread(MainActivity.this::scheduleDurableSync);
+                nativeResult(requestId, true, result);
+            } catch (Exception error) { nativeResult(requestId, false, message(error)); } });
         }
         @JavascriptInterface public void setSystemTheme(boolean dark, String color) {
             runOnUiThread(() -> {
-                try { getWindow().setStatusBarColor(Color.parseColor(color)); getWindow().setNavigationBarColor(Color.parseColor(color)); }
+                try {
+                    int themeColor = Color.parseColor(color);
+                    getWindow().setStatusBarColor(themeColor);
+                    getWindow().setNavigationBarColor(themeColor);
+                    getWindow().getDecorView().setBackgroundColor(themeColor);
+                    webView.setBackgroundColor(themeColor);
+                }
                 catch (Exception ignored) {}
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     WindowInsetsController controller = getWindow().getInsetsController();

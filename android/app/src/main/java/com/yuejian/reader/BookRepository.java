@@ -40,7 +40,7 @@ import java.util.zip.ZipInputStream;
 
 
 final class BookRepository extends SQLiteOpenHelper {
-    private static final String EPUB_PARSER_REVISION = "2";
+    private static final String EPUB_PARSER_REVISION = "3";
     private final Context context;
     private final File booksDir;
 
@@ -97,13 +97,23 @@ final class BookRepository extends SQLiteOpenHelper {
                 db.execSQL("INSERT OR REPLACE INTO app_state(key,value,updated) VALUES('sync.reading_legacy_migrated','1',?)", new Object[]{System.currentTimeMillis()});
             }
         }
-        if (oldVersion < 7) createPerformanceIndexes(db);
         if (oldVersion < 8) {
-            db.execSQL("ALTER TABLE books ADD COLUMN category TEXT NOT NULL DEFAULT '未分类'");
-            db.execSQL("ALTER TABLE books ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
-            db.execSQL("ALTER TABLE books ADD COLUMN description TEXT NOT NULL DEFAULT ''");
-            db.execSQL("ALTER TABLE chapters ADD COLUMN depth INTEGER NOT NULL DEFAULT 0");
+            addColumnIfMissing(db, "books", "category", "TEXT NOT NULL DEFAULT '未分类'");
+            addColumnIfMissing(db, "books", "tags", "TEXT NOT NULL DEFAULT '[]'");
+            addColumnIfMissing(db, "books", "description", "TEXT NOT NULL DEFAULT ''");
+            addColumnIfMissing(db, "chapters", "depth", "INTEGER NOT NULL DEFAULT 0");
         }
+        if (oldVersion < 8) createPerformanceIndexes(db);
+    }
+
+    private static void addColumnIfMissing(SQLiteDatabase db, String table, String column, String definition) {
+        boolean exists = false;
+        try (Cursor cursor = db.rawQuery("PRAGMA table_info(" + table + ")", null)) {
+            while (cursor.moveToNext()) {
+                if (column.equalsIgnoreCase(cursor.getString(1))) { exists = true; break; }
+            }
+        }
+        if (!exists) db.execSQL("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
     }
 
     private static void createFeatureTables(SQLiteDatabase db) {

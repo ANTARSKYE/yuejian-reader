@@ -1,17 +1,17 @@
-# 阅见 Reader 1.5.0
+# 阅见 Reader 1.5.2
 
 阅见是一款面向 Windows、Android 手机和平板的本地优先 AI 电子书阅读器，支持 EPUB/TXT 阅读、分章深度分析、精确批注、多色高亮、阅读报告、本地书架和多种阅读主题。
 
 ## 新版界面
 
-### Windows 桌面端 1.5.0
+### Windows 桌面端 1.5.2
 
-![阅见 Windows 桌面端 1.5.0 星空主题](docs/screenshots/desktop-v1.4.8.png)
+![阅见 Windows 桌面端 1.5.2 星空主题](docs/screenshots/desktop-v1.4.8.png)
 
-### Android 手机与平板端 1.3.0
+### Android 手机与平板端 1.3.2
 
 <p align="center">
-  <img src="docs/screenshots/mobile-v1.2.8.jpg" width="420" alt="阅见 Android 1.3.0 星空主题书架">
+  <img src="docs/screenshots/mobile-v1.2.8.jpg" width="420" alt="阅见 Android 1.3.2 星空主题书架">
 </p>
 
 ## 直接使用
@@ -26,7 +26,7 @@
 本地构建后的 Windows 程序位于：
 
 ```text
-dist/Yuejian-Reader-1.5.0.exe
+dist/Yuejian-Reader-1.5.2.exe
 ```
 
 Android 正式安装包构建后位于：
@@ -158,7 +158,7 @@ cd android
 最终产物固定为：
 
 ```text
-dist/Yuejian-Reader-1.5.0.exe
+dist/Yuejian-Reader-1.5.2.exe
 dist/Yuejian-Sync-Server.exe
 ```
 

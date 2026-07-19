@@ -615,6 +615,27 @@ input {
 button {
   cursor: pointer;
   border: 0;
+  appearance: none;
+  -webkit-appearance: none;
+}
+input[type="file"] {
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  color: var(--muted);
+  padding: 6px;
+}
+input[type="file"]::file-selector-button,
+input[type="file"]::-webkit-file-upload-button {
+  margin-right: 10px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--green);
+  color: var(--paper);
+  padding: 9px 13px;
+  font-weight: 800;
+  cursor: pointer;
 }
 .shell {
   max-width: 1440px;
@@ -1010,6 +1031,7 @@ button {
   color: #62685d;
   font-size: 14px;
 }
+.chapters .toc-depth-0{margin-top:7px;border-top:1px solid var(--line)}.chapters .toc-depth-0:first-child{margin-top:0;border-top:0}.chapters .toc-depth-0 button{padding:13px 9px 10px!important;color:var(--ink);font-size:14px;font-weight:800}.chapters .toc-depth-1 button{padding:10px 9px 10px 26px!important;color:color-mix(in srgb,var(--ink) 78%,var(--muted));font-size:13px;font-weight:650}.chapters .toc-depth-2 button{padding:9px 9px 9px 42px!important;font-size:12px}.chapters .toc-depth-3 button,.chapters .toc-depth-4 button{padding:8px 9px 8px 56px!important;font-size:11.5px}.chapters .toc-depth-5 button,.chapters .toc-depth-6 button,.chapters .toc-depth-7 button,.chapters .toc-depth-8 button{padding:8px 9px 8px 68px!important;font-size:11px}.chapters li:not(.toc-depth-0){position:relative}.chapters li:not(.toc-depth-0)::before{content:"";position:absolute;z-index:1;top:50%;left:14px;width:7px;height:1px;background:var(--line);pointer-events:none}
 .chapters button:hover,
 .chapters button.active {
   background: #edf4d1;
@@ -2555,6 +2577,14 @@ button {
   grid-template-columns: 1fr auto;
   gap: 7px;
 }
+.library-edit {
+  border: 1px solid color-mix(in srgb, var(--green) 58%, var(--line));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--green) 14%, var(--card));
+  color: var(--green);
+  padding: 9px 12px;
+  font-weight: 800;
+}
 .library-delete {
   border: 1px solid #e8c6c0;
   border-radius: 9px;
@@ -2813,7 +2843,7 @@ body[data-theme="cat"] .workspace > .panel {
 .book-editor-layer form,.reader-link-layer>section { width:min(650px,96vw); max-height:90vh; overflow:auto; padding:22px; border:1px solid var(--line); border-radius:24px; background:var(--paper); color:var(--ink); box-shadow:0 30px 90px rgba(0,0,0,.4); }
 .book-editor-layer header,.reader-link-layer header { display:flex; justify-content:space-between; gap:16px; }.book-editor-layer h2,.reader-link-layer h3{margin:3px 0 15px}.book-editor-layer header button,.reader-link-layer header button{width:38px;height:38px;border:0;border-radius:50%;background:var(--soft);color:var(--muted);font-size:23px}
 .book-editor-layer label{display:block;margin:12px 0;color:var(--muted);font-size:12px;font-weight:700}.book-editor-layer input,.book-editor-layer textarea{box-sizing:border-box;width:100%;margin-top:6px;padding:11px 12px;border:1px solid var(--line);border-radius:12px;background:var(--soft);color:var(--ink)}.book-editor-layer textarea{min-height:110px;resize:vertical}.book-editor-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.book-editor-layer footer,.reader-link-layer footer{display:flex;justify-content:flex-end;gap:9px;margin-top:16px}.book-editor-layer footer button,.reader-link-layer footer button,.reader-link-layer footer a{border:1px solid var(--line);border-radius:12px;padding:10px 15px;background:var(--soft);color:var(--ink);text-decoration:none}.book-editor-layer footer .primary{border-color:transparent;background:var(--accent);color:#102040;font-weight:800}.reader-link-content{padding:14px;border-left:4px solid var(--accent);border-radius:4px 13px 13px 4px;background:var(--soft);line-height:1.75;white-space:pre-wrap}
-.reader-history-actions{display:inline-flex;gap:6px}.reader-history-actions button{border:1px solid var(--line);border-radius:10px;padding:7px 10px;background:var(--soft);color:var(--ink)}
+.reader-history-actions{display:inline-flex;gap:6px}.reader-history-actions button{border:1px solid var(--line);border-radius:10px;padding:7px 10px;background:var(--soft);color:var(--ink)}.reader-history-actions button:disabled{opacity:.38;cursor:default}
 .desktop-annotation-card {
   width: min(680px, calc(100vw - 40px));
   max-height: 82vh;

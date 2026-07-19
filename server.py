@@ -38,7 +38,7 @@ from sync_local import LocalSyncManager
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Yuejian"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-VERSION = "1.5.0"
+VERSION = "1.5.2"
 CACHE_FILE = APP_DATA_DIR / "analysis-cache.json"
 TIMING_FILE = APP_DATA_DIR / "analysis-timings.json"
 CHUNK_CACHE_FILE = APP_DATA_DIR / "analysis-chunks.json"
